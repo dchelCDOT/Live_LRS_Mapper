@@ -64,7 +64,7 @@ st.markdown(f"""
 st.markdown(f"""
     <div class="cdot-banner">
         <img src="{CDOT_LOGO_URL}" alt="CDOT Logo">
-        <h1>LRS Mapper Pro</h1>
+        <h1>CDOT Route and Reference Mapper</h1>
     </div>
 """, unsafe_allow_html=True)
 
@@ -429,5 +429,6 @@ if st.session_state['processed']:
         mime="application/zip",
         type="primary"
     )
+
 
 
