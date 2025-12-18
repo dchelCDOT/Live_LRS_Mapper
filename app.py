@@ -22,7 +22,7 @@ st.set_page_config(
 
 # --- BRANDING CONSTANTS ---
 CDOT_BLUE = "#004899"
-CDOT_GREEN = "#78BE20"
+CDOT_GREEN = "#245436"
 CDOT_LOGO_URL = "https://www.codot.gov/assets/sitelogo.png"
 
 # --- CUSTOM CSS ---
@@ -429,3 +429,4 @@ if st.session_state['processed']:
         mime="application/zip",
         type="primary"
     )
+
