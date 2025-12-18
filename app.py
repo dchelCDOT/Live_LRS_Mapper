@@ -4,13 +4,14 @@ import geopandas as gpd
 from shapely.geometry import Point, LineString
 from shapely.ops import substring
 import folium
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import requests
 import io
 import os
 from zipfile import ZipFile
 
-# --- PAGE CONFIG & CDOT BRANDING ---
+# --- PAGE CONFIG ---
 st.set_page_config(
     page_title="CDOT LRS Mapper Pro",
     page_icon="🛣️",
@@ -18,56 +19,56 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Official CDOT Colors and Custom CSS
+# --- BRANDING CONSTANTS ---
 CDOT_BLUE = "#004899"
 CDOT_GREEN = "#78BE20"
 CDOT_LOGO_URL = "https://www.codot.gov/assets/sitelogo.png"
 
+# --- CUSTOM CSS ---
 st.markdown(f"""
     <style>
-        /* Main headers */
-        h1, h2, h3 {{
-            color: {CDOT_BLUE} !important;
-        }}
-        /* Custom Banner Style */
+        /* Headers */
+        h1, h2, h3 {{ color: {CDOT_BLUE} !important; }}
+        
+        /* Custom Banner - White Background for Logo Visibility */
         .cdot-banner {{
-            background-color: {CDOT_BLUE};
+            background-color: white;
             padding: 20px;
+            border-bottom: 5px solid {CDOT_GREEN}; /* CDOT Green Accent */
             border-radius: 10px;
-            color: white;
             display: flex;
             align-items: center;
             margin-bottom: 20px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
         }}
         .cdot-banner img {{
-            height: 50px; /* Adjusted for new logo aspect ratio */
-            margin-right: 20px;
+            height: 60px;
+            margin-right: 25px;
         }}
         .cdot-banner h1 {{
-            color: white !important;
+            color: {CDOT_BLUE} !important;
             margin: 0;
             padding: 0;
             font-size: 2.5rem;
+            font-weight: 800;
         }}
-        /* Primary Button Override */
+        
+        /* Primary Button */
         div.stButton > button:first-child {{
             background-color: {CDOT_GREEN};
             color: white;
             border: none;
             font-weight: bold;
+            font-size: 1.1rem;
         }}
         div.stButton > button:first-child:hover {{
             background-color: {CDOT_BLUE};
             border: 2px solid {CDOT_GREEN};
         }}
-        /* Info box styling */
-        .stAlert {{
-            border-left-color: {CDOT_BLUE} !important;
-        }}
     </style>
 """, unsafe_allow_html=True)
 
-# --- APP HEADER ---
+# --- HEADER ---
 st.markdown(f"""
     <div class="cdot-banner">
         <img src="{CDOT_LOGO_URL}" alt="CDOT Logo">
@@ -75,54 +76,48 @@ st.markdown(f"""
     </div>
 """, unsafe_allow_html=True)
 
-# --- INSTRUCTIONS & ABOUT ---
+# --- INSTRUCTIONS ---
 with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expanded=True):
     col_about, col_how = st.columns(2)
     with col_about:
         st.subheader("What is this tool?")
         st.markdown("""
-        This application is a **Linear Referencing System (LRS) Mapper**. 
+        This tool maps tabular data (spreadsheets with Mileposts) onto the official CDOT Route Network.
         
-        It takes tabular data (spreadsheets) containing Route IDs and Mileposts and visualizes them spatially on the official CDOT network.
-        
-        **Key Features:**
-        * Supports CSV and Excel (.xlsx) files.
-        * Maps both Points and Lines.
-        * Exports shapefiles and error reports.
+        **Features:**
+        * **Live Error Fixing:** Edit bad data directly in the app and re-map it.
+        * **High Performance:** Handles large datasets with clustering.
+        * **Export:** Generates Shapefiles and Error Reports.
         """)
-    
     with col_how:
         st.subheader("How to use it")
         st.markdown("""
-        1.  **Upload Data:** Upload your file below.
-        2.  **Configure Mapping:** Select the columns for **Route ID**, **Begin Milepost**, and **End Milepost**.
-        3.  **Run Analysis:** Click the green button to process the geometry.
-        4.  **Download:** Get your results as a Shapefile ZIP.
+        1.  **Upload** your CSV or Excel file.
+        2.  **Map Columns** (Route ID, Begin MP, End MP).
+        3.  **Run Analysis**.
+        4.  **Fix Errors** (if any) in the table that appears, then click **Re-Run**.
+        5.  **Download** final results.
         """)
 
 st.divider()
 
 # --- CONSTANTS ---
 ROUTE_SERVICE_URL = "https://services.arcgis.com/yzB9WM8W0BO3Ql7d/arcgis/rest/services/Routes_gdb/FeatureServer/0"
-CALC_CRS = "EPSG:3857" # Web Mercator (Meters)
-MAP_CRS = "EPSG:4326"  # WGS84 (Lat/Long)
+CALC_CRS = "EPSG:3857" # Meters
+MAP_CRS = "EPSG:4326"  # Lat/Long
 
-# --- UTILS ---
-@st.cache_data
-def get_layer_columns(service_url):
-    params = {'where': '1=1', 'outFields': '*', 'f': 'json', 'resultRecordCount': 1}
-    try:
-        r = requests.get(f"{service_url}/query", params=params)
-        data = r.json()
-        if 'fields' in data: return [f['name'] for f in data['fields']]
-        return []
-    except: return []
+# --- STATE MANAGEMENT ---
+if 'success_pts' not in st.session_state: st.session_state['success_pts'] = []
+if 'success_lns' not in st.session_state: st.session_state['success_lns'] = []
+if 'error_df' not in st.session_state: st.session_state['error_df'] = None
+if 'processed' not in st.session_state: st.session_state['processed'] = False
 
+# --- GIS UTILS ---
 @st.cache_data
 def get_arcgis_features(service_url):
     all_features = []
     offset = 0
-    with st.spinner("Fetching Official CDOT Route Network..."):
+    with st.spinner("Fetching Official CDOT Route Network... (One time load)"):
         while True:
             params = {
                 'where': '1=1', 'outFields': '*', 'f': 'geojson',
@@ -142,229 +137,289 @@ def get_arcgis_features(service_url):
     gdf.set_crs(MAP_CRS, inplace=True)
     return gdf
 
-# --- SESSION STATE SETUP ---
-if 'results' not in st.session_state:
-    st.session_state['results'] = None
+def process_batch(df_batch, routes, col_map, mode):
+    """
+    Core LRS Logic.
+    Returns: (list_of_valid_pts, list_of_valid_lns, list_of_error_rows)
+    """
+    # Unpack columns
+    rid_col = col_map['rid']
+    bm_col = col_map['bm']
+    em_col = col_map['em']
+    gis_rid = col_map['gis_rid']
+    
+    # Ensure string matching
+    routes[gis_rid] = routes[gis_rid].astype(str)
+    df_batch[rid_col] = df_batch[rid_col].astype(str)
+    
+    v_pts, v_lns, errs = [], [], []
+    unit_factor = 1609.34 # Miles to Meters
+    
+    for idx, row in df_batch.iterrows():
+        try:
+            # 1. Match Route
+            rid = row[rid_col]
+            match = routes[routes[gis_rid] == rid]
+            
+            if match.empty:
+                raise ValueError(f"Route ID '{rid}' Not Found")
+            
+            geom_meters = match.iloc[0].geometry
+            
+            # 2. Parse Begin Measure
+            try: bm_val = float(row[bm_col])
+            except: raise ValueError(f"Invalid Begin Measure: {row[bm_col]}")
+            
+            bm_meters = bm_val * unit_factor
+            
+            # 3. Determine Geometry Type
+            is_point = False
+            if mode == 'Point': is_point = True
+            elif mode == 'Line': is_point = False
+            else: # Both
+                if em_col == '(None)' or pd.isna(row.get(em_col)): is_point = True
+            
+            # 4. Generate Geometry
+            if is_point:
+                pt_geom = geom_meters.interpolate(bm_meters)
+                res = row.copy()
+                res['geometry'] = pt_geom
+                # Remove Error_Message column if it exists (from previous fixes)
+                if 'Error_Message' in res: del res['Error_Message']
+                v_pts.append(res)
+            else:
+                try: em_val = float(row[em_col])
+                except: raise ValueError(f"Invalid End Measure: {row.get(em_col)}")
+                
+                em_meters = em_val * unit_factor
+                
+                if bm_meters >= em_meters:
+                    if bm_meters == em_meters: raise ValueError("Begin MP == End MP (Use Point mode)")
+                    else: raise ValueError(f"End MP ({em_val}) < Begin MP ({bm_val})")
+                
+                ln_geom = substring(geom_meters, bm_meters, em_meters)
+                
+                if ln_geom.is_empty: raise ValueError("Result empty (Measures outside route limits?)")
+                elif ln_geom.geom_type in ['Point', 'MultiPoint']: raise ValueError("Collapsed to Point (Length too short)")
+                else:
+                    res = row.copy()
+                    res['geometry'] = ln_geom
+                    if 'Error_Message' in res: del res['Error_Message']
+                    v_lns.append(res)
 
-# --- APP LOGIC ---
+        except Exception as e:
+            row['Error_Message'] = str(e)
+            errs.append(row)
+            
+    return v_pts, v_lns, errs
+
+# --- UI SECTION 1: UPLOAD ---
 st.subheader("1. Data Upload")
+st.info(f"**Need help formatting?** Use our [Google Sheets Tool]({'https://script.google.com/a/macros/state.co.us/s/AKfycbxNe4UVfAAngo5W0M_fTrduePeip-yW4zbGRm6NIjNY-87rQy3D86jshHVBUXpPxb5p7A/exec'}).")
 
-# Helper Link Box
-st.info(f"**Need help formatting your data?** \nUse our [Data Formatting Tool]({'https://script.google.com/a/macros/state.co.us/s/AKfycbxNe4UVfAAngo5W0M_fTrduePeip-yW4zbGRm6NIjNY-87rQy3D86jshHVBUXpPxb5p7A/exec'}) to prepare your spreadsheet for this mapper.")
+uploaded_file = st.file_uploader("Upload .csv or .xlsx", type=["csv", "xlsx"])
 
-uploaded_file = st.file_uploader("Upload your spreadsheet (.csv or .xlsx)", type=["csv", "xlsx"])
-
-df = None
-
-if uploaded_file is not None:
-    # FILE HANDLING LOGIC
+if uploaded_file:
+    # Load Data
     try:
         if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
+            df_main = pd.read_csv(uploaded_file)
+            default_out_name = os.path.splitext(uploaded_file.name)[0]
         else:
-            # Excel Logic
             xls = pd.ExcelFile(uploaded_file)
-            sheet_names = xls.sheet_names
-            
-            if len(sheet_names) > 1:
-                selected_sheet = st.selectbox("Select the sheet containing your data:", sheet_names)
-                df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+            if len(xls.sheet_names) > 1:
+                sheet = st.selectbox("Select Sheet", xls.sheet_names)
+                df_main = pd.read_excel(uploaded_file, sheet_name=sheet)
+                default_out_name = sheet
             else:
-                df = pd.read_excel(uploaded_file, sheet_name=sheet_names[0])
-                
+                df_main = pd.read_excel(uploaded_file, sheet_name=xls.sheet_names[0])
+                default_out_name = os.path.splitext(uploaded_file.name)[0]
     except Exception as e:
         st.error(f"Error reading file: {e}")
         st.stop()
-
-# Proceed only if DF is loaded
-if df is not None:
-    csv_cols = list(df.columns)
+        
+    cols = list(df_main.columns)
     
+    # --- UI SECTION 2: CONFIG ---
     st.divider()
     st.subheader("2. Configuration")
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown(f"<h4 style='color:{CDOT_BLUE}'>Spreadsheet Columns</h4>", unsafe_allow_html=True)
-        csv_rid = st.selectbox("Which column holds the Route ID?", csv_cols, index=0 if csv_cols else None)
-        bm_col = st.selectbox("Which column holds the Begin Milepost?", csv_cols, index=1 if len(csv_cols)>1 else 0)
-        em_col_opts = ['(None)'] + csv_cols
-        em_col = st.selectbox("Which column holds the End Milepost? (Optional for points)", em_col_opts, index=0)
-        
-    with col2:
-        st.markdown(f"<h4 style='color:{CDOT_BLUE}'>Analysis Settings</h4>", unsafe_allow_html=True)
-        mode = st.radio("What feature type are you mapping?", ["Point", "Line", "Both"], index=2)
-        out_name = st.text_input("Desired Output Filename (no extension needed)", "CDOT_LRS_Results")
-    
+    c1, c2 = st.columns(2)
+    with c1:
+        rid_col = st.selectbox("Route ID Column", cols, index=0)
+        bm_col = st.selectbox("Begin MP Column", cols, index=1 if len(cols)>1 else 0)
+        em_opts = ['(None)'] + cols
+        em_col = st.selectbox("End MP Column (Optional)", em_opts, index=0)
+    with c2:
+        mode = st.radio("Feature Type", ["Point", "Line", "Both"], index=2)
+        out_name = st.text_input("Output Filename", default_out_name)
+
+    # --- ACTION BUTTONS ---
     st.divider()
-    # --- RUN BUTTON ---
-    if st.button("🚀 Run LRS Analysis", type="primary"):
-        # 1. Load Routes
+    
+    # Run Button
+    if st.button("🚀 Run Analysis", type="primary"):
+        # Reset State
+        st.session_state['success_pts'] = []
+        st.session_state['success_lns'] = []
+        st.session_state['error_df'] = None
+        
+        # Load GIS
         raw_routes = get_arcgis_features(ROUTE_SERVICE_URL)
-        if raw_routes is None:
-            st.error("Failed to load routes from ArcGIS.")
-            st.stop()
-            
+        if raw_routes is None: st.stop()
         routes = raw_routes.to_crs(CALC_CRS)
         
-        # 2. Auto-Detect GIS Route Column
+        # Detect GIS Column
         gis_rid = None
-        possible_names = ['ROUTE', 'Route', 'route', 'RouteID', 'Route_ID', 'RteID']
-        for name in possible_names:
-            if name in routes.columns:
-                gis_rid = name
-                break
-        if not gis_rid:
-            for c in routes.columns:
-                if c.upper() == 'ROUTE':
-                    gis_rid = c
-                    break     
-        if not gis_rid:
-            gis_rid = routes.columns[0]
+        for c in routes.columns:
+            if c.upper() in ['ROUTE', 'ROUTEID', 'RTEID', 'ROUTE_ID']:
+                gis_rid = c; break
+        if not gis_rid: gis_rid = routes.columns[0]
         
-        # 3. Process
-        routes[gis_rid] = routes[gis_rid].astype(str)
-        df[csv_rid] = df[csv_rid].astype(str)
+        # Pack Col Map
+        col_map = {'rid': rid_col, 'bm': bm_col, 'em': em_col, 'gis_rid': gis_rid}
+        st.session_state['col_map'] = col_map # Save for re-runs
         
-        valid_pts, valid_lns, errors = [], [], []
-        unit_factor = 1609.34 # Hardcoded Miles to Meters
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        total_rows = len(df)
-        
-        for idx, row in df.iterrows():
-            if idx % max(1, int(total_rows/10)) == 0:
-                progress = idx / total_rows
-                progress_bar.progress(progress)
-                status_text.text(f"Processing row {idx+1} of {total_rows}...")
+        with st.spinner("Processing..."):
+            pts, lns, errs = process_batch(df_main, routes, col_map, mode)
+            
+            st.session_state['success_pts'] = pts
+            st.session_state['success_lns'] = lns
+            if errs:
+                # Move Error Message to front
+                err_df = pd.DataFrame(errs)
+                cols = list(err_df.columns)
+                cols.insert(0, cols.pop(cols.index('Error_Message')))
+                st.session_state['error_df'] = err_df[cols]
+                
+        st.session_state['processed'] = True
 
-            try:
-                rid = row[csv_rid]
-                match = routes[routes[gis_rid] == rid]
+# --- UI SECTION 3: RESULTS & FIXING ---
+if st.session_state['processed']:
+    
+    # 1. LIVE ERROR FIXING
+    if st.session_state['error_df'] is not None and not st.session_state['error_df'].empty:
+        st.markdown(f"### ⚠️ Errors Found: {len(st.session_state['error_df'])}")
+        st.warning("Below are rows that failed. **Edit them directly in the table below** to fix typos (e.g., fix Route IDs), then click 'Re-Run Fixes'.")
+        
+        # Editable Dataframe
+        edited_errors = st.data_editor(
+            st.session_state['error_df'],
+            num_rows="dynamic",
+            use_container_width=True,
+            key="editor"
+        )
+        
+        col_fix, col_skip = st.columns([1, 4])
+        with col_fix:
+            if st.button("🔄 Re-Run Fixes"):
+                # Load GIS
+                raw_routes = get_arcgis_features(ROUTE_SERVICE_URL)
+                routes = raw_routes.to_crs(CALC_CRS)
+                col_map = st.session_state['col_map']
                 
-                if match.empty:
-                    raise ValueError(f"Route ID '{rid}' Not Found in CDOT Network")
+                with st.spinner("Re-processing fixes..."):
+                    # Process ONLY the edited rows
+                    new_pts, new_lns, new_errs = process_batch(edited_errors, routes, col_map, mode)
                     
-                geom_meters = match.iloc[0].geometry
-                
-                try: bm_val = float(row[bm_col])
-                except: raise ValueError(f"Invalid Begin Measure value: {row[bm_col]}")
+                    # Merge successes
+                    st.session_state['success_pts'].extend(new_pts)
+                    st.session_state['success_lns'].extend(new_lns)
                     
-                bm_meters = bm_val * unit_factor
-                
-                is_point = False
-                if mode.lower() == 'point': is_point = True
-                elif mode.lower() == 'line': is_point = False
-                else: 
-                    if em_col == '(None)' or pd.isna(row.get(em_col)): is_point = True
-                
-                if is_point:
-                    pt_geom = geom_meters.interpolate(bm_meters)
-                    res = row.copy()
-                    res['geometry'] = pt_geom
-                    valid_pts.append(res)
-                else:
-                    try: em_val = float(row[em_col])
-                    except: raise ValueError(f"Invalid End Measure value: {row.get(em_col)}")
-                         
-                    em_meters = em_val * unit_factor
-                    
-                    if bm_meters >= em_meters:
-                        if bm_meters == em_meters: raise ValueError("Begin MP equals End MP (Please use Point mode for this feature)")
-                        else: raise ValueError(f"End MP ({em_val}) is less than Begin MP ({bm_val})")
-                    
-                    ln_geom = substring(geom_meters, bm_meters, em_meters)
-                    
-                    if ln_geom.is_empty: raise ValueError("Resulting geometry is empty (measures may be outside route limits)")
-                    elif ln_geom.geom_type in ['Point', 'MultiPoint']: raise ValueError("Geometry collapsed to Point due to precision (length too short)")
+                    # Update Errors (if any remain)
+                    if new_errs:
+                        err_df = pd.DataFrame(new_errs)
+                        cols = list(err_df.columns)
+                        if 'Error_Message' in cols:
+                            cols.insert(0, cols.pop(cols.index('Error_Message')))
+                        st.session_state['error_df'] = err_df[cols]
+                        st.error(f"{len(new_errs)} rows still have errors.")
                     else:
-                        res = row.copy()
-                        res['geometry'] = ln_geom
-                        valid_lns.append(res)
+                        st.session_state['error_df'] = None
+                        st.success("All errors fixed!")
+                        st.rerun()
 
-            except Exception as e:
-                errors.append({**row, "Error_Message": str(e)})
-                    
-        progress_bar.progress(100)
-        status_text.text("Finalizing results...")
-        
-        # SAVE TO SESSION STATE
-        st.session_state['results'] = {
-            'pts': valid_pts,
-            'lns': valid_lns,
-            'errors': errors,
-            'out_name': out_name
-        }
-
-# --- RENDER RESULTS (Persistent) ---
-if st.session_state['results']:
-    res = st.session_state['results']
+    # 2. MAP & DOWNLOAD
     st.divider()
     st.subheader("3. Results & Download")
     
-    # Summary Metrics
+    n_pts = len(st.session_state['success_pts'])
+    n_lns = len(st.session_state['success_lns'])
+    n_err = len(st.session_state['error_df']) if st.session_state['error_df'] is not None else 0
+    
     m1, m2, m3 = st.columns(3)
-    m1.metric("Mapped Points", len(res['pts']))
-    m2.metric("Mapped Lines", len(res['lns']))
-    m3.metric("Rows with Errors", len(res['errors']), delta_color="inverse")
-
-    if res['errors']:
-        st.warning(f"⚠️ {len(res['errors'])} rows could not be mapped. Please download the result ZIP and check the 'Error_Report.csv' file for details on how to fix your data.")
-
+    m1.metric("Mapped Points", n_pts)
+    m2.metric("Mapped Lines", n_lns)
+    m3.metric("Remaining Errors", n_err, delta_color="inverse")
+    
     # MAP
-    st.markdown("##### Interactive Preview Map (Center: Colorado)")
-    # Center roughly on Colorado
-    m = folium.Map(location=[39.113, -105.358], zoom_start=7)
+    m = folium.Map(location=[39.1, -105.5], zoom_start=7)
     
-    def add_layer(data, name, color):
-        if not data: return
-        gdf = gpd.GeoDataFrame(data, crs=CALC_CRS).to_crs(MAP_CRS)
-        cols = [c for c in gdf.columns if c != 'geometry']
-        folium.GeoJson(
-            gdf, name=name,
-            style_function=lambda x: {'color': color, 'weight': 5},
-            popup=folium.GeoJsonPopup(fields=cols)
-        ).add_to(m)
+    # Helper for Points (Cluster)
+    if n_pts > 0:
+        pts_gdf = gpd.GeoDataFrame(st.session_state['success_pts'], crs=CALC_CRS).to_crs(MAP_CRS)
         
-    add_layer(res['lns'], "Mapped Lines", CDOT_BLUE)
-    add_layer(res['pts'], "Mapped Points", CDOT_GREEN)
+        # Create Marker Cluster
+        marker_cluster = MarkerCluster(name="Mapped Points").add_to(m)
+        
+        for idx, row in pts_gdf.iterrows():
+            # Create popup text
+            pop_txt = "<br>".join([f"<b>{k}:</b> {v}" for k,v in row.drop('geometry').items()])
+            
+            folium.CircleMarker(
+                location=[row.geometry.y, row.geometry.x],
+                radius=6,
+                color=CDOT_GREEN,
+                fill=True,
+                fill_color=CDOT_GREEN,
+                fill_opacity=0.8,
+                popup=folium.Popup(pop_txt, max_width=300)
+            ).add_to(marker_cluster)
+
+    # Helper for Lines (Standard)
+    if n_lns > 0:
+        lns_gdf = gpd.GeoDataFrame(st.session_state['success_lns'], crs=CALC_CRS).to_crs(MAP_CRS)
+        folium.GeoJson(
+            lns_gdf,
+            name="Mapped Lines",
+            style_function=lambda x: {'color': CDOT_BLUE, 'weight': 4},
+            popup=folium.GeoJsonPopup(fields=[c for c in lns_gdf.columns if c != 'geometry'])
+        ).add_to(m)
+
     folium.LayerControl().add_to(m)
-    
     st_folium(m, width=1000, height=600)
     
     # DOWNLOAD
-    st.divider()
-    st.subheader("Download Files")
-    st.write("Click below to download a ZIP file containing Shapefiles of your mapped features and a CSV report of any errors.")
-    
     zip_buffer = io.BytesIO()
     with ZipFile(zip_buffer, 'w') as zipf:
-        if res['errors']:
-            err_csv = pd.DataFrame(res['errors']).to_csv(index=False)
-            zipf.writestr("Error_Report.csv", err_csv)
+        # Save Remaining Errors
+        if n_err > 0:
+            csv_data = st.session_state['error_df'].to_csv(index=False)
+            zipf.writestr("Remaining_Errors.csv", csv_data)
         
-        def write_shp_to_zip(data, name):
+        def save_shp(data, suffix):
             if not data: return
             tmp_gdf = gpd.GeoDataFrame(data, crs=CALC_CRS).to_crs(MAP_CRS)
-            tmp_path = f"/tmp/{name}.shp"
-            tmp_gdf.to_file(tmp_path)
+            # Fix column types for shapefile (datetime/object issues)
+            for col in tmp_gdf.columns:
+                if tmp_gdf[col].dtype == 'object':
+                    tmp_gdf[col] = tmp_gdf[col].astype(str)
             
-            base_dir = "/tmp"
-            for f in os.listdir(base_dir):
-                if f.startswith(name): 
-                    zipf.write(os.path.join(base_dir, f), f)
-                    try: os.remove(os.path.join(base_dir, f)) 
-                    except: pass
-        
-        write_shp_to_zip(res['lns'], f"{res['out_name']}_Lines")
-        write_shp_to_zip(res['pts'], f"{res['out_name']}_Points")
+            name = f"{out_name}_{suffix}"
+            path = f"/tmp/{name}.shp"
+            tmp_gdf.to_file(path)
+            for f in os.listdir("/tmp"):
+                if f.startswith(name):
+                    zipf.write(os.path.join("/tmp", f), f)
+                    os.remove(os.path.join("/tmp", f))
+
+        save_shp(st.session_state['success_pts'], "Points")
+        save_shp(st.session_state['success_lns'], "Lines")
         
     st.download_button(
-        label=f"📦 Download Final Results ({res['out_name']}.zip)",
+        label=f"📦 Download ZIP ({out_name}.zip)",
         data=zip_buffer.getvalue(),
-        file_name=f"{res['out_name']}.zip",
+        file_name=f"{out_name}.zip",
         mime="application/zip",
         type="primary"
     )
