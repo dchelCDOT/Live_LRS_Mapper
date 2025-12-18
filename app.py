@@ -88,7 +88,7 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         1.  **Upload** your CSV or Excel file.
         2.  **Map Columns** (Route ID, Begin MP, End MP).
         3.  **Run Analysis** & Fix Errors.
-        4.  **Download** results OR **Login** (sidebar) to upload to GeoHub/AGOL.
+        4.  **Download** results OR **Login** below to upload to GeoHub/AGOL.
         """)
 
 st.divider()
@@ -105,6 +105,8 @@ if 'error_df' not in st.session_state: st.session_state['error_df'] = None
 if 'processed' not in st.session_state: st.session_state['processed'] = False
 if 'gis' not in st.session_state: st.session_state['gis'] = None
 if 'user_layers' not in st.session_state: st.session_state['user_layers'] = {}
+# Initialize URL state if not present
+if 'portal_url' not in st.session_state: st.session_state['portal_url'] = "https://maps.codot.gov/portal/"
 
 # --- UTILS ---
 @st.cache_data
@@ -189,7 +191,7 @@ def handle_arcgis_upload(gis, zip_path, layer_title, folder_name, overwrite_item
     """Handles logic for publishing new OR overwriting specific item."""
     try:
         if overwrite_item_id:
-            # OVERWRITE LOGIC (Directly targeting selected item)
+            # OVERWRITE LOGIC
             item = gis.content.get(overwrite_item_id)
             if not item: return "ERROR", "Target Item not found."
             
@@ -198,17 +200,14 @@ def handle_arcgis_upload(gis, zip_path, layer_title, folder_name, overwrite_item
             return "OVERWRITTEN", item.homepage
         else:
             # PUBLISH NEW
-            # Check for existing name collision first
             query = f"title:\"{layer_title}\" AND owner:\"{gis.users.me.username}\" AND type:\"Feature Service\""
             search_res = gis.content.search(query=query, max_items=1)
             
             if search_res:
                 return "EXISTS", search_res[0].homepage
 
-            # Add Shapefile Item
             item_props = {'type': 'Shapefile', 'title': layer_title, 'tags': 'CDOT, LRS'}
             shp_item = gis.content.add(item_props, data=zip_path, folder=folder_name)
-            # Publish
             feat_item = shp_item.publish()
             return "PUBLISHED", feat_item.homepage
             
@@ -341,44 +340,6 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             errs.append(row)
             
     return v_pts, v_lns, errs
-
-# --- SIDEBAR: LOGIN & CONTENT FETCH ---
-with st.sidebar:
-    st.write("### ☁️ Upload Login (Optional)")
-    st.caption("Login to publish results to your Portal. This is not required to use the mapping tools.")
-    
-    if ARCGIS_AVAILABLE:
-        with st.form("agol_login"):
-            portal_type = st.selectbox("Destination Portal", ["ArcGIS Online", "GeoHub (Enterprise)"])
-            
-            if portal_type == "ArcGIS Online":
-                default_url = "https://www.arcgis.com"
-            else:
-                default_url = "https://maps.codot.gov/portal/"
-            
-            agol_url = st.text_input("Portal URL", default_url)
-            agol_user = st.text_input("Username")
-            agol_pass = st.text_input("Password", type="password")
-            
-            agol_btn = st.form_submit_button("Authenticate")
-        
-        if agol_btn and agol_user and agol_pass:
-            try:
-                gis = GIS(agol_url, agol_user, agol_pass)
-                st.session_state['gis'] = gis
-                st.session_state['agol_creds'] = (agol_url, agol_user, agol_pass)
-                
-                # --- AUTO-FETCH USER CONTENT ---
-                user_content = gis.users.me.items(item_type="Feature Layer Collection", max_items=100)
-                # Store as dict: {"Title (ID)": "ItemID"}
-                st.session_state['user_layers'] = {f"{item.title} ({item.id})": item.id for item in user_content}
-                
-                st.success(f"✅ Connected as {gis.users.me.username}. Found {len(user_content)} layers.")
-                
-            except Exception as e:
-                st.error(f"Login failed: {e}")
-    else:
-        st.warning("⚠️ 'arcgis' Python library not found. Upload disabled.")
 
 # --- UI SECTION 1: UPLOAD ---
 st.subheader("1. Data Upload")
@@ -572,9 +533,14 @@ if st.session_state['processed']:
     st_folium(m, width=1000, height=600)
     
     # --- DOWNLOAD & UPLOAD SECTION ---
+    st.divider()
+    st.subheader("4. Publish & Export")
+    
     col_dl, col_ul = st.columns(2)
     
     with col_dl:
+        st.write("##### 💾 Download Local Files")
+        st.write("Download mapped results as Shapefiles.")
         zip_buffer = io.BytesIO()
         with ZipFile(zip_buffer, 'w') as zipf:
             if n_err > 0:
@@ -607,48 +573,86 @@ if st.session_state['processed']:
         )
 
     with col_ul:
-        if 'gis' in st.session_state:
-            st.write("#### ☁️ Publish to Portal")
-            
-            # 1. Choose Upload Mode
-            up_mode = st.radio("Upload Mode", ["New Layer", "Overwrite Existing"], horizontal=True)
-            
-            target_item_id = None
-            
-            if up_mode == "New Layer":
-                up_name = st.text_input("New Layer Name", f"{out_name}_LRS")
-                up_folder = st.text_input("Folder (Optional)")
-            else:
-                # OVERWRITE MODE - Select from User Layers
-                if st.session_state['user_layers']:
-                    selected_layer_key = st.selectbox("Select Layer to Overwrite", list(st.session_state['user_layers'].keys()))
-                    target_item_id = st.session_state['user_layers'][selected_layer_key]
-                    up_name = selected_layer_key # Just for labeling
-                    up_folder = None
-                else:
-                    st.warning("No Feature Layers found in your content.")
-                    up_mode = "Disabled"
-
-            if st.button("Upload & Publish") and up_mode != "Disabled":
-                with st.spinner("Processing Upload..."):
-                    # Retrieve creds
-                    url, user, pwd = st.session_state.get('agol_creds')
-                    gis_obj = st.session_state['gis']
+        if ARCGIS_AVAILABLE:
+            with st.expander("☁️ Upload to ArcGIS / GeoHub", expanded=False):
+                # LOGIN UI
+                if st.session_state['gis'] is None:
+                    st.warning("Please Login to proceed.")
                     
-                    if n_pts > 0:
-                        zip_path = prep_shapefile_zip(st.session_state['success_pts'], f"{out_name}_Points")
-                        if zip_path:
-                            status, msg = handle_arcgis_upload(gis_obj, zip_path, f"{up_name}_Points", up_folder, target_item_id)
-                            if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Points {status}: [View Item]({msg})")
-                            elif status == "EXISTS": st.warning(f"Layer '{up_name}_Points' already exists. Use 'Overwrite Existing' mode.")
-                            else: st.error(f"Points Error: {msg}")
-                        
-                    if n_lns > 0:
-                        zip_path = prep_shapefile_zip(st.session_state['success_lns'], f"{out_name}_Lines")
-                        if zip_path:
-                            status, msg = handle_arcgis_upload(gis_obj, zip_path, f"{up_name}_Lines", up_folder, target_item_id)
-                            if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Lines {status}: [View Item]({msg})")
-                            elif status == "EXISTS": st.warning(f"Layer '{up_name}_Lines' already exists. Use 'Overwrite Existing' mode.")
-                            else: st.error(f"Lines Error: {msg}")
+                    # Callback to update URL
+                    def update_portal_url():
+                        if st.session_state.portal_type_selector == "ArcGIS Online":
+                            st.session_state.portal_url = "https://www.arcgis.com"
+                        else:
+                            st.session_state.portal_url = "https://maps.codot.gov/portal/"
+
+                    p_type = st.selectbox("Select Portal", ["GeoHub (Enterprise)", "ArcGIS Online"], key="portal_type_selector", on_change=update_portal_url)
+                    p_url = st.text_input("Portal URL", key="portal_url")
+                    p_user = st.text_input("Username")
+                    p_pass = st.text_input("Password", type="password")
+                    
+                    if st.button("Connect"):
+                        try:
+                            gis = GIS(p_url, p_user, p_pass)
+                            st.session_state['gis'] = gis
+                            st.session_state['agol_creds'] = (p_url, p_user, p_pass)
+                            
+                            # Fetch Content
+                            with st.spinner("Fetching your content..."):
+                                user_content = gis.users.me.items(item_type="Feature Layer Collection", max_items=100)
+                                st.session_state['user_layers'] = {f"{item.title} ({item.id})": item.id for item in user_content}
+                            st.success(f"Connected as {gis.users.me.username}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Login Failed: {e}")
+                
+                # UPLOAD UI (Only if logged in)
+                else:
+                    gis = st.session_state['gis']
+                    st.success(f"Logged in as: **{gis.users.me.username}**")
+                    if st.button("Logout"):
+                        st.session_state['gis'] = None
+                        st.rerun()
+                    
+                    st.divider()
+                    
+                    # 1. Choose Upload Mode
+                    up_mode = st.radio("Upload Mode", ["New Layer", "Overwrite Existing"], horizontal=True)
+                    
+                    target_item_id = None
+                    up_name = ""
+                    
+                    if up_mode == "New Layer":
+                        up_name = st.text_input("New Layer Name", f"{out_name}_LRS")
+                        up_folder = st.text_input("Folder (Optional)")
+                    else:
+                        # OVERWRITE MODE - Select from User Layers
+                        if st.session_state['user_layers']:
+                            selected_layer_key = st.selectbox("Select Layer to Overwrite", list(st.session_state['user_layers'].keys()))
+                            target_item_id = st.session_state['user_layers'][selected_layer_key]
+                            up_name = selected_layer_key.split(" (")[0] # Just for labeling
+                            up_folder = None
+                        else:
+                            st.warning("No Feature Layers found in your content.")
+                            up_mode = "Disabled"
+
+                    if st.button("Upload & Publish") and up_mode != "Disabled":
+                        with st.spinner("Processing Upload..."):
+                            
+                            if n_pts > 0:
+                                zip_path = prep_shapefile_zip(st.session_state['success_pts'], f"{up_name}_Points")
+                                if zip_path:
+                                    status, msg = handle_arcgis_upload(gis, zip_path, f"{up_name}_Points", up_folder, target_item_id)
+                                    if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Points {status}: [View Item]({msg})")
+                                    elif status == "EXISTS": st.warning(f"Layer '{up_name}_Points' already exists. Use 'Overwrite Existing' mode.")
+                                    else: st.error(f"Points Error: {msg}")
+                                
+                            if n_lns > 0:
+                                zip_path = prep_shapefile_zip(st.session_state['success_lns'], f"{up_name}_Lines")
+                                if zip_path:
+                                    status, msg = handle_arcgis_upload(gis, zip_path, f"{up_name}_Lines", up_folder, target_item_id)
+                                    if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Lines {status}: [View Item]({msg})")
+                                    elif status == "EXISTS": st.warning(f"Layer '{up_name}_Lines' already exists. Use 'Overwrite Existing' mode.")
+                                    else: st.error(f"Lines Error: {msg}")
         else:
-            st.info("Login via Sidebar to enable ArcGIS/GeoHub Upload.")
+            st.info("The 'arcgis' library is missing. Upload features are disabled.")
