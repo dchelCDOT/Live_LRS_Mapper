@@ -363,45 +363,43 @@ if st.session_state['processed']:
     m2.metric("Mapped Lines", n_lns)
     m3.metric("Remaining Errors", n_err, delta_color="inverse")
     
-    # MAP
-    m = folium.Map(location=[39.1, -105.5], zoom_start=7)
+    # --- PERFORMANCE OPTIMIZATION: CANVAS MAP ---
+    # prefer_canvas=True forces Leaflet to use HTML5 Canvas renderer
+    # This renders thousands of points smoothly without clustering.
+    m = folium.Map(
+        location=[39.1, -105.5], 
+        zoom_start=7, 
+        prefer_canvas=True 
+    )
     
-    # Helper for Points (Cluster)
+    # Helper for Points (Canvas Optimized)
     if n_pts > 0:
         pts_gdf = gpd.GeoDataFrame(st.session_state['success_pts'], crs=CALC_CRS).to_crs(MAP_CRS)
         
-        # Create Marker Cluster
-        marker_cluster = MarkerCluster(name="Mapped Points").add_to(m)
+        # We use a FeatureGroup instead of MarkerCluster
+        fg = folium.FeatureGroup(name="Mapped Points")
         
         for idx, row in pts_gdf.iterrows():
-            # --- HANDLE NONE GEOMETRY ---
-            if row.geometry is None:
-                if ignore_errors:
-                    continue  # Skip invalid geometry
-                else:
-                    st.error(f"Error on row {idx}: Geometry is NoneType. Cannot map.")
-                    st.stop()
-                    
-            try:
-                # Create popup text
-                pop_txt = "<br>".join([f"<b>{k}:</b> {v}" for k,v in row.drop('geometry').items()])
-                
-                folium.CircleMarker(
-                    location=[row.geometry.y, row.geometry.x],
-                    radius=6,
-                    color=CDOT_GREEN,
-                    fill=True,
-                    fill_color=CDOT_GREEN,
-                    fill_opacity=0.8,
-                    popup=folium.Popup(pop_txt, max_width=300)
-                ).add_to(marker_cluster)
-            except AttributeError:
-                 # Catch cases where geometry exists but lacks .y/.x
-                if ignore_errors:
-                    continue
-                else:
-                    st.error(f"Error on row {idx}: Invalid geometry object.")
-                    st.stop()
+            if row.geometry is None: continue
+
+            # Create popup text
+            # We limit the popup complexity for speed
+            pop_txt = f"<b>Route:</b> {row.get(st.session_state['col_map']['rid'], 'N/A')}<br>" \
+                      f"<b>MP:</b> {row.get(st.session_state['col_map']['bm'], 'N/A')}"
+            
+            folium.CircleMarker(
+                location=[row.geometry.y, row.geometry.x],
+                radius=3,              # Small radius for cleaner look
+                weight=1,              # Thin border
+                color="white",         # White border
+                fill=True,
+                fill_color=CDOT_GREEN, # CDOT Green fill
+                fill_opacity=0.9,
+                popup=folium.Popup(pop_txt, max_width=200),
+                tooltip=f"Row {idx}"   # Hover text is faster than click
+            ).add_to(fg)
+            
+        fg.add_to(m)
 
     # Helper for Lines (Standard)
     if n_lns > 0:
@@ -409,7 +407,7 @@ if st.session_state['processed']:
         folium.GeoJson(
             lns_gdf,
             name="Mapped Lines",
-            style_function=lambda x: {'color': CDOT_BLUE, 'weight': 4},
+            style_function=lambda x: {'color': CDOT_BLUE, 'weight': 3, 'opacity': 0.8},
             popup=folium.GeoJsonPopup(fields=[c for c in lns_gdf.columns if c != 'geometry'])
         ).add_to(m)
 
@@ -456,3 +454,4 @@ if st.session_state['processed']:
         mime="application/zip",
         type="primary"
     )
+
