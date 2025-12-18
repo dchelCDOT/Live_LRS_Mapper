@@ -234,6 +234,13 @@ if uploaded_file:
             else:
                 df_main = pd.read_excel(uploaded_file, sheet_name=xls.sheet_names[0])
                 default_out_name = os.path.splitext(uploaded_file.name)[0]
+        
+        # --- CLEAN EMPTY ROWS ---
+        # Removes rows where ALL columns are empty
+        df_main.dropna(how='all', inplace=True)
+        # Reset index to ensure clean iteration later
+        df_main.reset_index(drop=True, inplace=True)
+
     except Exception as e:
         st.error(f"Error reading file: {e}")
         st.stop()
@@ -256,7 +263,7 @@ if uploaded_file:
     
     # --- NEW: IGNORE ERROR TOGGLE ---
     st.write("")
-    ignore_errors = st.checkbox("Ignore rows with invalid geometries (Fixes 'NoneType' errors)", value=True)
+    ignore_errors = st.checkbox("Ignore rows with mapping errors to allow valid rows to map", value=True)
 
     # --- ACTION BUTTONS ---
     st.divider()
@@ -367,7 +374,7 @@ if st.session_state['processed']:
         marker_cluster = MarkerCluster(name="Mapped Points").add_to(m)
         
         for idx, row in pts_gdf.iterrows():
-            # --- UPDATED: HANDLE NONE GEOMETRY ---
+            # --- HANDLE NONE GEOMETRY ---
             if row.geometry is None:
                 if ignore_errors:
                     continue  # Skip invalid geometry
@@ -420,7 +427,7 @@ if st.session_state['processed']:
         def save_shp(data, suffix):
             if not data: return
             
-            # --- UPDATED: FILTER NONE GEOMETRY BEFORE SAVING ---
+            # --- FILTER NONE GEOMETRY BEFORE SAVING ---
             valid_data = [d for d in data if d.get('geometry') is not None]
             
             if not valid_data: return
