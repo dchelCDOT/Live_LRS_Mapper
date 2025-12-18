@@ -242,21 +242,17 @@ if uploaded_file:
         out_name = st.text_input("Output Filename", default_out_name)
     with c3:
         st.write("<b>Map Visualization</b>", unsafe_allow_html=True)
-        # --- NEW: COLOR PICKER ---
+        # --- COLOR PICKER ---
         feature_color = st.color_picker("Feature Color", CDOT_GREEN)
         
-        # --- NEW: IGNORE ERROR TOGGLE ---
+        # --- IGNORE ERROR TOGGLE ---
         st.write("")
         ignore_errors = st.checkbox("Ignore rows with mapping errors to allow valid rows to map", value=True)
 
-    # --- IMPROVED: EMPTY ROW CLEANING ---
-    # Drops rows where the ESSENTIAL columns (Route ID or Begin MP) are missing.
-    # This is more robust than dropna(how='all') because a row with no ID is useless anyway.
+    # --- EMPTY ROW CLEANING ---
     before_len = len(df_main)
     df_main = df_main.dropna(subset=[rid_col, bm_col], how='any')
-    # Also handle strings that are just whitespace
     if len(df_main) > 0:
-        # Create mask for empty strings in essential cols
         mask = df_main[rid_col].astype(str).str.strip() == ''
         df_main = df_main[~mask]
     
@@ -348,23 +344,17 @@ if st.session_state['processed']:
     
     # Helper for Points (Optimized GeoJSON)
     if n_pts > 0:
-        # Filter None geometry before creating GeoDataFrame
         valid_pts = [p for p in st.session_state['success_pts'] if p['geometry'] is not None]
         
         if valid_pts:
             pts_gdf = gpd.GeoDataFrame(valid_pts, crs=CALC_CRS).to_crs(MAP_CRS)
-            
-            # Convert Timestamps to string to avoid JSON errors
             for col in pts_gdf.columns:
                 if pd.api.types.is_datetime64_any_dtype(pts_gdf[col]):
                     pts_gdf[col] = pts_gdf[col].astype(str)
 
-            # --- OPTIMIZATION: Use GeoJson with JS styling ---
-            # This avoids creating thousands of markers in Python loops
             folium.GeoJson(
                 pts_gdf,
                 name="Mapped Points",
-                # This JS function renders points as CircleMarkers client-side
                 point_to_layer=JsCode(f"""
                     function(feature, latlng) {{
                         return L.circleMarker(latlng, {{
@@ -377,16 +367,15 @@ if st.session_state['processed']:
                         }});
                     }}
                 """),
-                # Automatically creates a table popup for all fields
+                # --- UPDATED: SCROLLABLE POPUP ---
                 popup=folium.GeoJsonPopup(
                     fields=[c for c in pts_gdf.columns if c != 'geometry'],
-                    style="max-width: 300px;"
+                    style="max-width: 400px; max-height: 300px; overflow-y: auto; display: block;"
                 )
             ).add_to(m)
 
     # Helper for Lines (Standard)
     if n_lns > 0:
-        # Filter None
         valid_lns = [l for l in st.session_state['success_lns'] if l['geometry'] is not None]
         
         if valid_lns:
@@ -399,7 +388,11 @@ if st.session_state['processed']:
                 lns_gdf,
                 name="Mapped Lines",
                 style_function=lambda x: {'color': feature_color, 'weight': 3},
-                popup=folium.GeoJsonPopup(fields=[c for c in lns_gdf.columns if c != 'geometry'])
+                # --- UPDATED: SCROLLABLE POPUP ---
+                popup=folium.GeoJsonPopup(
+                    fields=[c for c in lns_gdf.columns if c != 'geometry'],
+                    style="max-width: 400px; max-height: 300px; overflow-y: auto; display: block;"
+                )
             ).add_to(m)
 
     folium.LayerControl().add_to(m)
