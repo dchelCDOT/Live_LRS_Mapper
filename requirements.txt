@@ -5,3 +5,4 @@ shapely
 folium
 streamlit-folium
 requests
+openpyxl
