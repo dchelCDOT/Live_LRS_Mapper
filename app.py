@@ -21,7 +21,7 @@ st.set_page_config(
 # Official CDOT Colors and Custom CSS
 CDOT_BLUE = "#004899"
 CDOT_GREEN = "#78BE20"
-CDOT_LOGO_URL = "https://www.codot.gov/++theme++codot.theme/images/cdot-logo.png"
+CDOT_LOGO_URL = "https://www.codot.gov/assets/sitelogo.png"
 
 st.markdown(f"""
     <style>
@@ -40,7 +40,7 @@ st.markdown(f"""
             margin-bottom: 20px;
         }}
         .cdot-banner img {{
-            height: 60px;
+            height: 50px; /* Adjusted for new logo aspect ratio */
             margin-right: 20px;
         }}
         .cdot-banner h1 {{
@@ -83,22 +83,21 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         st.markdown("""
         This application is a **Linear Referencing System (LRS) Mapper**. 
         
-        It is designed to take tabular data (like spreadsheets containing asset locations, project limits, or maintenance records) and visualize it spatially on a map without requiring complex GIS software like ArcGIS Pro.
+        It takes tabular data (spreadsheets) containing Route IDs and Mileposts and visualizes them spatially on the official CDOT network.
         
-        **What it's for:**
-        * Mapping data that only has Route IDs and Mileposts.
-        * Quickly validating location data quality.
-        * Generating Shapefiles for use in other systems.
+        **Key Features:**
+        * Supports CSV and Excel (.xlsx) files.
+        * Maps both Points and Lines.
+        * Exports shapefiles and error reports.
         """)
     
     with col_how:
         st.subheader("How to use it")
         st.markdown("""
-        1.  **Upload Data:** Drag and drop your `.csv` spreadsheet below.
-        2.  **Configure Mapping:** Tell the tool which columns in your spreadsheet contain the **Route ID**, **Begin Milepost**, and **End Milepost**.
-        3.  **Select Type:** Choose if you are mapping Points, Lines, or both.
-        4.  **Run Analysis:** Click the green button. The tool will fetch the official CDOT road network and perform the mapping math.
-        5.  **Review & Download:** Interactively check the map results and download a ZIP file containing Shapefiles and an error report.
+        1.  **Upload Data:** Upload your file below.
+        2.  **Configure Mapping:** Select the columns for **Route ID**, **Begin Milepost**, and **End Milepost**.
+        3.  **Run Analysis:** Click the green button to process the geometry.
+        4.  **Download:** Get your results as a Shapefile ZIP.
         """)
 
 st.divider()
@@ -149,15 +148,40 @@ if 'results' not in st.session_state:
 
 # --- APP LOGIC ---
 st.subheader("1. Data Upload")
-uploaded_file = st.file_uploader("Upload your spreadsheet here (.csv format)", type="csv")
+
+# Helper Link Box
+st.info(f"**Need help formatting your data?** \nUse our [Data Formatting Tool]({'https://script.google.com/a/macros/state.co.us/s/AKfycbxNe4UVfAAngo5W0M_fTrduePeip-yW4zbGRm6NIjNY-87rQy3D86jshHVBUXpPxb5p7A/exec'}) to prepare your spreadsheet for this mapper.")
+
+uploaded_file = st.file_uploader("Upload your spreadsheet (.csv or .xlsx)", type=["csv", "xlsx"])
+
+df = None
 
 if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
+    # FILE HANDLING LOGIC
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            # Excel Logic
+            xls = pd.ExcelFile(uploaded_file)
+            sheet_names = xls.sheet_names
+            
+            if len(sheet_names) > 1:
+                selected_sheet = st.selectbox("Select the sheet containing your data:", sheet_names)
+                df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+            else:
+                df = pd.read_excel(uploaded_file, sheet_name=sheet_names[0])
+                
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        st.stop()
+
+# Proceed only if DF is loaded
+if df is not None:
     csv_cols = list(df.columns)
     
     st.divider()
     st.subheader("2. Configuration")
-    st.markdown("Map your spreadsheet columns to the required inputs.")
     
     col1, col2 = st.columns(2)
     
