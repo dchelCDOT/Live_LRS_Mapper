@@ -4,6 +4,7 @@ import geopandas as gpd
 from shapely.geometry import Point, LineString
 from shapely.ops import substring
 import folium
+from folium import JsCode
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import requests
@@ -30,40 +31,31 @@ st.markdown(f"""
         /* Headers */
         h1, h2, h3 {{ color: {CDOT_BLUE} !important; }}
         
-        /* Custom Banner - White Background for Logo Visibility */
+        /* Custom Banner */
         .cdot-banner {{
             background-color: white;
             padding: 20px;
-            border-bottom: 5px solid {CDOT_GREEN}; /* CDOT Green Accent */
+            border-bottom: 5px solid {CDOT_GREEN};
             border-radius: 10px;
             display: flex;
             align-items: center;
             margin-bottom: 20px;
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
         }}
-        .cdot-banner img {{
-            height: 60px;
-            margin-right: 25px;
-        }}
+        .cdot-banner img {{ height: 60px; margin-right: 25px; }}
         .cdot-banner h1 {{
             color: {CDOT_BLUE} !important;
-            margin: 0;
-            padding: 0;
-            font-size: 2.5rem;
-            font-weight: 800;
+            margin: 0; padding: 0;
+            font-size: 2.5rem; font-weight: 800;
         }}
         
-        /* Primary Button */
+        /* Buttons */
         div.stButton > button:first-child {{
-            background-color: {CDOT_GREEN};
-            color: white;
-            border: none;
-            font-weight: bold;
-            font-size: 1.1rem;
+            background-color: {CDOT_GREEN}; color: white;
+            border: none; font-weight: bold; font-size: 1.1rem;
         }}
         div.stButton > button:first-child:hover {{
-            background-color: {CDOT_BLUE};
-            border: 2px solid {CDOT_GREEN};
+            background-color: {CDOT_BLUE}; border: 2px solid {CDOT_GREEN};
         }}
     </style>
 """, unsafe_allow_html=True)
@@ -86,7 +78,7 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         
         **Features:**
         * **Live Error Fixing:** Edit bad data directly in the app and re-map it.
-        * **High Performance:** Handles large datasets with clustering.
+        * **High Performance:** optimized for speed.
         * **Export:** Generates Shapefiles and Error Reports.
         """)
     with col_how:
@@ -95,7 +87,7 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         1.  **Upload** your CSV or Excel file.
         2.  **Map Columns** (Route ID, Begin MP, End MP).
         3.  **Run Analysis**.
-        4.  **Fix Errors** (if any) in the table that appears, then click **Re-Run**.
+        4.  **Fix Errors** (if any) in the table that appears.
         5.  **Download** final results.
         """)
 
@@ -138,10 +130,6 @@ def get_arcgis_features(service_url):
     return gdf
 
 def process_batch(df_batch, routes, col_map, mode):
-    """
-    Core LRS Logic.
-    Returns: (list_of_valid_pts, list_of_valid_lns, list_of_error_rows)
-    """
     # Unpack columns
     rid_col = col_map['rid']
     bm_col = col_map['bm']
@@ -184,7 +172,6 @@ def process_batch(df_batch, routes, col_map, mode):
                 pt_geom = geom_meters.interpolate(bm_meters)
                 res = row.copy()
                 res['geometry'] = pt_geom
-                # Remove Error_Message column if it exists (from previous fixes)
                 if 'Error_Message' in res: del res['Error_Message']
                 v_pts.append(res)
             else:
@@ -199,8 +186,8 @@ def process_batch(df_batch, routes, col_map, mode):
                 
                 ln_geom = substring(geom_meters, bm_meters, em_meters)
                 
-                if ln_geom.is_empty: raise ValueError("Result empty (Measures outside route limits?)")
-                elif ln_geom.geom_type in ['Point', 'MultiPoint']: raise ValueError("Collapsed to Point (Length too short)")
+                if ln_geom.is_empty: raise ValueError("Result empty")
+                elif ln_geom.geom_type in ['Point', 'MultiPoint']: raise ValueError("Collapsed to Point")
                 else:
                     res = row.copy()
                     res['geometry'] = ln_geom
@@ -234,13 +221,6 @@ if uploaded_file:
             else:
                 df_main = pd.read_excel(uploaded_file, sheet_name=xls.sheet_names[0])
                 default_out_name = os.path.splitext(uploaded_file.name)[0]
-        
-        # --- CLEAN EMPTY ROWS ---
-        # Removes rows where ALL columns are empty
-        df_main.dropna(how='all', inplace=True)
-        # Reset index to ensure clean iteration later
-        df_main.reset_index(drop=True, inplace=True)
-
     except Exception as e:
         st.error(f"Error reading file: {e}")
         st.stop()
@@ -251,7 +231,7 @@ if uploaded_file:
     st.divider()
     st.subheader("2. Configuration")
     
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
         rid_col = st.selectbox("Route ID Column", cols, index=0)
         bm_col = st.selectbox("Begin MP Column", cols, index=1 if len(cols)>1 else 0)
@@ -260,17 +240,31 @@ if uploaded_file:
     with c2:
         mode = st.radio("Feature Type", ["Point", "Line", "Both"], index=2)
         out_name = st.text_input("Output Filename", default_out_name)
-    
-    # --- NEW: IGNORE ERROR TOGGLE ---
-    st.write("")
-    ignore_errors = st.checkbox("Ignore rows with mapping errors to allow valid rows to map", value=True)
+    with c3:
+        st.write("<b>Map Visualization</b>", unsafe_allow_html=True)
+        # --- NEW: COLOR PICKER ---
+        feature_color = st.color_picker("Feature Color", CDOT_GREEN)
+        
+        # --- NEW: IGNORE ERROR TOGGLE ---
+        st.write("")
+        ignore_errors = st.checkbox("Ignore rows with mapping errors to allow valid rows to map", value=True)
 
+    # --- IMPROVED: EMPTY ROW CLEANING ---
+    # Drops rows where the ESSENTIAL columns (Route ID or Begin MP) are missing.
+    # This is more robust than dropna(how='all') because a row with no ID is useless anyway.
+    before_len = len(df_main)
+    df_main = df_main.dropna(subset=[rid_col, bm_col], how='any')
+    # Also handle strings that are just whitespace
+    if len(df_main) > 0:
+        # Create mask for empty strings in essential cols
+        mask = df_main[rid_col].astype(str).str.strip() == ''
+        df_main = df_main[~mask]
+    
     # --- ACTION BUTTONS ---
     st.divider()
     
     # Run Button
     if st.button("🚀 Run Analysis", type="primary"):
-        # Reset State
         st.session_state['success_pts'] = []
         st.session_state['success_lns'] = []
         st.session_state['error_df'] = None
@@ -287,9 +281,8 @@ if uploaded_file:
                 gis_rid = c; break
         if not gis_rid: gis_rid = routes.columns[0]
         
-        # Pack Col Map
         col_map = {'rid': rid_col, 'bm': bm_col, 'em': em_col, 'gis_rid': gis_rid}
-        st.session_state['col_map'] = col_map # Save for re-runs
+        st.session_state['col_map'] = col_map
         
         with st.spinner("Processing..."):
             pts, lns, errs = process_batch(df_main, routes, col_map, mode)
@@ -297,7 +290,6 @@ if uploaded_file:
             st.session_state['success_pts'] = pts
             st.session_state['success_lns'] = lns
             if errs:
-                # Move Error Message to front
                 err_df = pd.DataFrame(errs)
                 cols = list(err_df.columns)
                 cols.insert(0, cols.pop(cols.index('Error_Message')))
@@ -311,38 +303,26 @@ if st.session_state['processed']:
     # 1. LIVE ERROR FIXING
     if st.session_state['error_df'] is not None and not st.session_state['error_df'].empty:
         st.markdown(f"### ⚠️ Errors Found: {len(st.session_state['error_df'])}")
-        st.warning("Below are rows that failed. **Edit them directly in the table below** to fix typos (e.g., fix Route IDs), then click 'Re-Run Fixes'.")
+        st.warning("Below are rows that failed. **Edit them directly in the table below** to fix typos, then click 'Re-Run Fixes'.")
         
-        # Editable Dataframe
-        edited_errors = st.data_editor(
-            st.session_state['error_df'],
-            num_rows="dynamic",
-            use_container_width=True,
-            key="editor"
-        )
+        edited_errors = st.data_editor(st.session_state['error_df'], num_rows="dynamic", use_container_width=True, key="editor")
         
         col_fix, col_skip = st.columns([1, 4])
         with col_fix:
             if st.button("🔄 Re-Run Fixes"):
-                # Load GIS
                 raw_routes = get_arcgis_features(ROUTE_SERVICE_URL)
                 routes = raw_routes.to_crs(CALC_CRS)
                 col_map = st.session_state['col_map']
                 
                 with st.spinner("Re-processing fixes..."):
-                    # Process ONLY the edited rows
                     new_pts, new_lns, new_errs = process_batch(edited_errors, routes, col_map, mode)
-                    
-                    # Merge successes
                     st.session_state['success_pts'].extend(new_pts)
                     st.session_state['success_lns'].extend(new_lns)
                     
-                    # Update Errors (if any remain)
                     if new_errs:
                         err_df = pd.DataFrame(new_errs)
                         cols = list(err_df.columns)
-                        if 'Error_Message' in cols:
-                            cols.insert(0, cols.pop(cols.index('Error_Message')))
+                        if 'Error_Message' in cols: cols.insert(0, cols.pop(cols.index('Error_Message')))
                         st.session_state['error_df'] = err_df[cols]
                         st.error(f"{len(new_errs)} rows still have errors.")
                     else:
@@ -363,53 +343,64 @@ if st.session_state['processed']:
     m2.metric("Mapped Lines", n_lns)
     m3.metric("Remaining Errors", n_err, delta_color="inverse")
     
-    # --- PERFORMANCE OPTIMIZATION: CANVAS MAP ---
-    # prefer_canvas=True forces Leaflet to use HTML5 Canvas renderer
-    # This renders thousands of points smoothly without clustering.
-    m = folium.Map(
-        location=[39.1, -105.5], 
-        zoom_start=7, 
-        prefer_canvas=True 
-    )
+    # --- PERFORMANCE MAP ---
+    m = folium.Map(location=[39.1, -105.5], zoom_start=7, prefer_canvas=True)
     
-    # Helper for Points (Canvas Optimized)
+    # Helper for Points (Optimized GeoJSON)
     if n_pts > 0:
-        pts_gdf = gpd.GeoDataFrame(st.session_state['success_pts'], crs=CALC_CRS).to_crs(MAP_CRS)
+        # Filter None geometry before creating GeoDataFrame
+        valid_pts = [p for p in st.session_state['success_pts'] if p['geometry'] is not None]
         
-        # We use a FeatureGroup instead of MarkerCluster
-        fg = folium.FeatureGroup(name="Mapped Points")
-        
-        for idx, row in pts_gdf.iterrows():
-            if row.geometry is None: continue
+        if valid_pts:
+            pts_gdf = gpd.GeoDataFrame(valid_pts, crs=CALC_CRS).to_crs(MAP_CRS)
+            
+            # Convert Timestamps to string to avoid JSON errors
+            for col in pts_gdf.columns:
+                if pd.api.types.is_datetime64_any_dtype(pts_gdf[col]):
+                    pts_gdf[col] = pts_gdf[col].astype(str)
 
-            # Create popup text
-            # We limit the popup complexity for speed
-            pop_txt = f"<b>Route:</b> {row.get(st.session_state['col_map']['rid'], 'N/A')}<br>" \
-                      f"<b>MP:</b> {row.get(st.session_state['col_map']['bm'], 'N/A')}"
-            
-            folium.CircleMarker(
-                location=[row.geometry.y, row.geometry.x],
-                radius=3,              # Small radius for cleaner look
-                weight=1,              # Thin border
-                color="white",         # White border
-                fill=True,
-                fill_color=CDOT_GREEN, # CDOT Green fill
-                fill_opacity=0.9,
-                popup=folium.Popup(pop_txt, max_width=200),
-                tooltip=f"Row {idx}"   # Hover text is faster than click
-            ).add_to(fg)
-            
-        fg.add_to(m)
+            # --- OPTIMIZATION: Use GeoJson with JS styling ---
+            # This avoids creating thousands of markers in Python loops
+            folium.GeoJson(
+                pts_gdf,
+                name="Mapped Points",
+                # This JS function renders points as CircleMarkers client-side
+                point_to_layer=JsCode(f"""
+                    function(feature, latlng) {{
+                        return L.circleMarker(latlng, {{
+                            radius: 5,
+                            fillColor: '{feature_color}',
+                            color: 'white',
+                            weight: 1,
+                            opacity: 1,
+                            fillOpacity: 0.8
+                        }});
+                    }}
+                """),
+                # Automatically creates a table popup for all fields
+                popup=folium.GeoJsonPopup(
+                    fields=[c for c in pts_gdf.columns if c != 'geometry'],
+                    style="max-width: 300px;"
+                )
+            ).add_to(m)
 
     # Helper for Lines (Standard)
     if n_lns > 0:
-        lns_gdf = gpd.GeoDataFrame(st.session_state['success_lns'], crs=CALC_CRS).to_crs(MAP_CRS)
-        folium.GeoJson(
-            lns_gdf,
-            name="Mapped Lines",
-            style_function=lambda x: {'color': CDOT_BLUE, 'weight': 3, 'opacity': 0.8},
-            popup=folium.GeoJsonPopup(fields=[c for c in lns_gdf.columns if c != 'geometry'])
-        ).add_to(m)
+        # Filter None
+        valid_lns = [l for l in st.session_state['success_lns'] if l['geometry'] is not None]
+        
+        if valid_lns:
+            lns_gdf = gpd.GeoDataFrame(valid_lns, crs=CALC_CRS).to_crs(MAP_CRS)
+            for col in lns_gdf.columns:
+                if pd.api.types.is_datetime64_any_dtype(lns_gdf[col]):
+                    lns_gdf[col] = lns_gdf[col].astype(str)
+            
+            folium.GeoJson(
+                lns_gdf,
+                name="Mapped Lines",
+                style_function=lambda x: {'color': feature_color, 'weight': 3},
+                popup=folium.GeoJsonPopup(fields=[c for c in lns_gdf.columns if c != 'geometry'])
+            ).add_to(m)
 
     folium.LayerControl().add_to(m)
     st_folium(m, width=1000, height=600)
@@ -417,25 +408,16 @@ if st.session_state['processed']:
     # DOWNLOAD
     zip_buffer = io.BytesIO()
     with ZipFile(zip_buffer, 'w') as zipf:
-        # Save Remaining Errors
         if n_err > 0:
             csv_data = st.session_state['error_df'].to_csv(index=False)
             zipf.writestr("Remaining_Errors.csv", csv_data)
         
         def save_shp(data, suffix):
-            if not data: return
-            
-            # --- FILTER NONE GEOMETRY BEFORE SAVING ---
             valid_data = [d for d in data if d.get('geometry') is not None]
-            
             if not valid_data: return
-
             tmp_gdf = gpd.GeoDataFrame(valid_data, crs=CALC_CRS).to_crs(MAP_CRS)
-            # Fix column types for shapefile (datetime/object issues)
             for col in tmp_gdf.columns:
-                if tmp_gdf[col].dtype == 'object':
-                    tmp_gdf[col] = tmp_gdf[col].astype(str)
-            
+                if tmp_gdf[col].dtype == 'object': tmp_gdf[col] = tmp_gdf[col].astype(str)
             name = f"{out_name}_{suffix}"
             path = f"/tmp/{name}.shp"
             tmp_gdf.to_file(path)
@@ -454,4 +436,3 @@ if st.session_state['processed']:
         mime="application/zip",
         type="primary"
     )
-
