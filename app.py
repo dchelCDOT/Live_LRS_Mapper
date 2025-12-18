@@ -253,6 +253,10 @@ if uploaded_file:
     with c2:
         mode = st.radio("Feature Type", ["Point", "Line", "Both"], index=2)
         out_name = st.text_input("Output Filename", default_out_name)
+    
+    # --- NEW: IGNORE ERROR TOGGLE ---
+    st.write("")
+    ignore_errors = st.checkbox("Ignore rows with invalid geometries (Fixes 'NoneType' errors)", value=True)
 
     # --- ACTION BUTTONS ---
     st.divider()
@@ -363,18 +367,34 @@ if st.session_state['processed']:
         marker_cluster = MarkerCluster(name="Mapped Points").add_to(m)
         
         for idx, row in pts_gdf.iterrows():
-            # Create popup text
-            pop_txt = "<br>".join([f"<b>{k}:</b> {v}" for k,v in row.drop('geometry').items()])
-            
-            folium.CircleMarker(
-                location=[row.geometry.y, row.geometry.x],
-                radius=6,
-                color=CDOT_GREEN,
-                fill=True,
-                fill_color=CDOT_GREEN,
-                fill_opacity=0.8,
-                popup=folium.Popup(pop_txt, max_width=300)
-            ).add_to(marker_cluster)
+            # --- UPDATED: HANDLE NONE GEOMETRY ---
+            if row.geometry is None:
+                if ignore_errors:
+                    continue  # Skip invalid geometry
+                else:
+                    st.error(f"Error on row {idx}: Geometry is NoneType. Cannot map.")
+                    st.stop()
+                    
+            try:
+                # Create popup text
+                pop_txt = "<br>".join([f"<b>{k}:</b> {v}" for k,v in row.drop('geometry').items()])
+                
+                folium.CircleMarker(
+                    location=[row.geometry.y, row.geometry.x],
+                    radius=6,
+                    color=CDOT_GREEN,
+                    fill=True,
+                    fill_color=CDOT_GREEN,
+                    fill_opacity=0.8,
+                    popup=folium.Popup(pop_txt, max_width=300)
+                ).add_to(marker_cluster)
+            except AttributeError:
+                 # Catch cases where geometry exists but lacks .y/.x
+                if ignore_errors:
+                    continue
+                else:
+                    st.error(f"Error on row {idx}: Invalid geometry object.")
+                    st.stop()
 
     # Helper for Lines (Standard)
     if n_lns > 0:
@@ -399,7 +419,13 @@ if st.session_state['processed']:
         
         def save_shp(data, suffix):
             if not data: return
-            tmp_gdf = gpd.GeoDataFrame(data, crs=CALC_CRS).to_crs(MAP_CRS)
+            
+            # --- UPDATED: FILTER NONE GEOMETRY BEFORE SAVING ---
+            valid_data = [d for d in data if d.get('geometry') is not None]
+            
+            if not valid_data: return
+
+            tmp_gdf = gpd.GeoDataFrame(valid_data, crs=CALC_CRS).to_crs(MAP_CRS)
             # Fix column types for shapefile (datetime/object issues)
             for col in tmp_gdf.columns:
                 if tmp_gdf[col].dtype == 'object':
@@ -423,4 +449,3 @@ if st.session_state['processed']:
         mime="application/zip",
         type="primary"
     )
-
