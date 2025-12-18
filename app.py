@@ -1,11 +1,10 @@
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point, LineString
+from shapely.geometry import Point, LineString, MultiLineString
 from shapely.ops import substring
 import folium
 from folium import JsCode
-from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import requests
 import io
@@ -24,34 +23,24 @@ st.set_page_config(
 CDOT_BLUE = "#004899"
 CDOT_GREEN = "#245436"
 CDOT_LOGO_URL = "https://www.codot.gov/assets/sitelogo.png"
-# Google Sheet Export Link (CSV)
+# Official CDOT Route Reference Table
 REF_SHEET_URL = "https://docs.google.com/spreadsheets/d/1XGOEZdtynaX3ox40GBD9SqhP1VlM69HSxIVsagxa3O8/export?format=csv"
 
 # --- CUSTOM CSS ---
 st.markdown(f"""
     <style>
-        /* Headers */
         h1, h2, h3 {{ color: {CDOT_BLUE} !important; }}
-        
-        /* Custom Banner */
         .cdot-banner {{
-            background-color: white;
-            padding: 20px;
-            border-bottom: 5px solid {CDOT_GREEN};
-            border-radius: 10px;
-            display: flex;
-            align-items: center;
-            margin-bottom: 20px;
+            background-color: white; padding: 20px;
+            border-bottom: 5px solid {CDOT_GREEN}; border-radius: 10px;
+            display: flex; align-items: center; margin-bottom: 20px;
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
         }}
         .cdot-banner img {{ height: 60px; margin-right: 25px; }}
         .cdot-banner h1 {{
-            color: {CDOT_BLUE} !important;
-            margin: 0; padding: 0;
+            color: {CDOT_BLUE} !important; margin: 0; padding: 0;
             font-size: 2.5rem; font-weight: 800;
         }}
-        
-        /* Buttons */
         div.stButton > button:first-child {{
             background-color: {CDOT_GREEN}; color: white;
             border: none; font-weight: bold; font-size: 1.1rem;
@@ -79,10 +68,9 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         This tool maps tabular data (spreadsheets with Mileposts) onto the official CDOT Route Network.
         
         **Features:**
-        * **Live Error Fixing:** Edit bad data directly in the app and re-map it.
-        * **Smart Validation:** Checks mileposts against official CDOT route limits.
-        * **High Performance:** Optimized for speed using HTML5 Canvas.
-        * **Export:** Generates Shapefiles and Error Reports.
+        * **Smart Validation:** Checks MP limits against the official CDOT Reference table.
+        * **Robust Mapping:** Automatically handles complex geometries and short segments.
+        * **Live Error Fixing:** Edit and re-run directly in the browser.
         """)
     with col_how:
         st.subheader("How to use it")
@@ -91,7 +79,7 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         2.  **Map Columns** (Route ID, Begin MP, End MP).
         3.  **Run Analysis**.
         4.  **Fix Errors** (if any) in the table that appears.
-        5.  **Download** final results.
+        5.  **Download** Shapefiles and Error Reports.
         """)
 
 st.divider()
@@ -106,7 +94,6 @@ if 'success_pts' not in st.session_state: st.session_state['success_pts'] = []
 if 'success_lns' not in st.session_state: st.session_state['success_lns'] = []
 if 'error_df' not in st.session_state: st.session_state['error_df'] = None
 if 'processed' not in st.session_state: st.session_state['processed'] = False
-if 'ref_data' not in st.session_state: st.session_state['ref_data'] = None
 
 # --- UTILS ---
 @st.cache_data
@@ -135,20 +122,18 @@ def get_arcgis_features(service_url):
 
 @st.cache_data
 def get_reference_data(url):
-    """Loads the Google Sheet to validate MP limits."""
+    """Loads Google Sheet for Route Validation."""
     try:
         df = pd.read_csv(url)
-        # Normalize columns to Upper Case for matching
+        # Normalize headers
         df.columns = [c.strip().upper() for c in df.columns]
         
-        # Identify key columns based on user instruction
-        # "ROUTE", "MINIMUM EXTENT", "MAXIMUM EXTENT"
+        # Locate columns dynamically based on keywords
         rid_col = next((c for c in df.columns if 'ROUTE' in c), None)
         min_col = next((c for c in df.columns if 'MINIMUM' in c and 'EXTENT' in c), None)
         max_col = next((c for c in df.columns if 'MAXIMUM' in c and 'EXTENT' in c), None)
         
         if rid_col and min_col and max_col:
-            # Create a clean lookup dictionary: { 'ROUTEID': {'min': 0.0, 'max': 50.0} }
             ref_dict = {}
             for _, row in df.iterrows():
                 try:
@@ -159,8 +144,7 @@ def get_reference_data(url):
                 except: continue
             return ref_dict
         return None
-    except Exception as e:
-        return None
+    except: return None
 
 def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
     # Unpack columns
@@ -180,7 +164,7 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
         try:
             rid = str(row[rid_col]).strip()
             
-            # --- 1. REFERENCE VALIDATION (The "Enhanced Error Message" Step) ---
+            # --- 1. REFERENCE VALIDATION ---
             if ref_lookup and rid in ref_lookup:
                 limits = ref_lookup[rid]
                 
@@ -189,29 +173,26 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                 except: raise ValueError(f"Invalid Begin Measure format: {row[bm_col]}")
                 
                 if bm_val < limits['min']:
-                    raise ValueError(f"Begin MP ({bm_val}) is below Route Minimum ({limits['min']})")
+                    raise ValueError(f"Begin MP ({bm_val}) is below Route {rid} Minimum ({limits['min']})")
                 if bm_val > limits['max']:
-                    raise ValueError(f"Begin MP ({bm_val}) exceeds Route Maximum ({limits['max']})")
+                    raise ValueError(f"Begin MP ({bm_val}) exceeds Route {rid} Maximum ({limits['max']})")
                 
-                # Check End MP (if line)
+                # Check End MP
                 if mode != 'Point' and em_col != '(None)' and not pd.isna(row.get(em_col)):
                     try: em_val = float(row[em_col])
                     except: raise ValueError(f"Invalid End Measure format: {row.get(em_col)}")
                     
                     if em_val > limits['max']:
-                        raise ValueError(f"End MP ({em_val}) exceeds Route Maximum ({limits['max']})")
+                        raise ValueError(f"End MP ({em_val}) exceeds Route {rid} Maximum ({limits['max']})")
             
             # --- 2. GIS PROCESSING ---
-            # Match Route
             match = routes[routes[gis_rid] == rid]
             if match.empty:
-                # If we have ref data but GIS failed, it might mean the GIS layer is outdated 
-                # or the ID format is slightly different.
                 raise ValueError(f"Route ID '{rid}' Not Found in GIS Network")
             
             geom_meters = match.iloc[0].geometry
             
-            # Parse Begin Measure
+            # Parse MPs
             bm_val = float(row[bm_col])
             bm_meters = bm_val * unit_factor
             
@@ -239,24 +220,30 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                     if bm_meters == em_meters: raise ValueError("Begin MP == End MP (Use Point mode)")
                     else: raise ValueError(f"End MP ({em_val}) < Begin MP ({bm_val})")
                 
-                # --- ROBUST LINE GENERATION (from previous step) ---
+                # --- ROBUST LINE GENERATION (AGGRESSIVE FALLBACK) ---
+                # 1. Try Standard Substring
                 ln_geom = substring(geom_meters, bm_meters, em_meters)
                 
-                if ln_geom.geom_type in ['Point', 'MultiPoint']:
-                    # Fallback: Manual Interpolation for short/collapsed segments
+                # 2. Validation: Did we get a valid line?
+                is_valid_line = not ln_geom.is_empty and ln_geom.geom_type in ['LineString', 'MultiLineString']
+                
+                if not is_valid_line:
+                    # 3. Fallback: Interpolate Endpoints explicitly
+                    # This handles gaps, complex topologies, or "collapsed" segments
                     p_start = geom_meters.interpolate(bm_meters)
                     p_end = geom_meters.interpolate(em_meters)
+                    
+                    # Check physical distance (Tolerance: 1 meter)
                     dist = p_start.distance(p_end)
                     
-                    if dist < 0.1: 
-                        route_len = geom_meters.length / unit_factor
-                        raise ValueError(f"Geometry collapsed (GIS Length: {route_len:.2f} mi). Verify MP range.")
-                    else:
+                    if dist > 1.0: 
+                        # Points are distinct -> Create Line manually
                         ln_geom = LineString([p_start, p_end])
+                    else:
+                        # Points are practically same location
+                        route_len = geom_meters.length / unit_factor
+                        raise ValueError(f"Geometry collapsed (GIS Length: {route_len:.2f} mi). MP Range likely outside GIS geometry.")
 
-                if ln_geom.is_empty: 
-                    raise ValueError("Result empty (Measures likely outside GIS geometry)")
-                
                 res = row.copy()
                 res['geometry'] = ln_geom
                 if 'Error_Message' in res: del res['Error_Message']
@@ -296,7 +283,6 @@ if df_main is not None:
     st.divider()
     st.subheader("2. Configuration")
     
-    # Input Data Mapping
     c1, c2, c3 = st.columns(3)
     with c1:
         rid_col = st.selectbox("Route ID Column", cols, index=0)
@@ -306,7 +292,6 @@ if df_main is not None:
         em_opts = ['(None)'] + cols
         em_col = st.selectbox("End MP Column (Optional)", em_opts, index=0)
 
-    # Output Settings
     st.write("")
     cc1, cc2, cc3 = st.columns(3)
     with cc1:
@@ -328,7 +313,6 @@ if df_main is not None:
     # --- ACTION BUTTONS ---
     st.divider()
     
-    # Run Button
     if st.button("🚀 Run Analysis", type="primary"):
         st.session_state['success_pts'] = []
         st.session_state['success_lns'] = []
@@ -340,7 +324,7 @@ if df_main is not None:
         routes = raw_routes.to_crs(CALC_CRS)
         
         # Load Reference Data
-        with st.spinner("Loading Route Limits Reference..."):
+        with st.spinner("Loading Official Route Limits..."):
             ref_lookup = get_reference_data(REF_SHEET_URL)
         
         # Detect GIS Column
@@ -352,7 +336,7 @@ if df_main is not None:
         
         col_map = {'rid': rid_col, 'bm': bm_col, 'em': em_col, 'gis_rid': gis_rid}
         st.session_state['col_map'] = col_map
-        st.session_state['ref_lookup'] = ref_lookup # Save for re-run
+        st.session_state['ref_lookup'] = ref_lookup
         
         with st.spinner("Processing..."):
             pts, lns, errs = process_batch(
@@ -374,7 +358,6 @@ if df_main is not None:
 # --- UI SECTION 3: RESULTS & FIXING ---
 if st.session_state['processed']:
     
-    # 1. LIVE ERROR FIXING
     if st.session_state['error_df'] is not None and not st.session_state['error_df'].empty:
         st.markdown(f"### ⚠️ Errors Found: {len(st.session_state['error_df'])}")
         st.warning("Below are rows that failed. **Edit them directly in the table below** to fix typos, then click 'Re-Run Fixes'.")
@@ -408,7 +391,6 @@ if st.session_state['processed']:
                         st.success("All errors fixed!")
                         st.rerun()
 
-    # 2. MAP & DOWNLOAD
     st.divider()
     st.subheader("3. Results & Download")
     
@@ -421,13 +403,10 @@ if st.session_state['processed']:
     m2.metric("Mapped Lines", n_lns)
     m3.metric("Remaining Errors", n_err, delta_color="inverse")
     
-    # --- PERFORMANCE MAP ---
     m = folium.Map(location=[39.1, -105.5], zoom_start=7, prefer_canvas=True)
     
-    # Helper for Points
     if n_pts > 0:
         valid_pts = [p for p in st.session_state['success_pts'] if p['geometry'] is not None]
-        
         if valid_pts:
             pts_gdf = gpd.GeoDataFrame(valid_pts, crs=CALC_CRS).to_crs(MAP_CRS)
             for col in pts_gdf.columns:
@@ -455,10 +434,8 @@ if st.session_state['processed']:
                 )
             ).add_to(m)
 
-    # Helper for Lines
     if n_lns > 0:
         valid_lns = [l for l in st.session_state['success_lns'] if l['geometry'] is not None]
-        
         if valid_lns:
             lns_gdf = gpd.GeoDataFrame(valid_lns, crs=CALC_CRS).to_crs(MAP_CRS)
             for col in lns_gdf.columns:
@@ -478,7 +455,6 @@ if st.session_state['processed']:
     folium.LayerControl().add_to(m)
     st_folium(m, width=1000, height=600)
     
-    # DOWNLOAD
     zip_buffer = io.BytesIO()
     with ZipFile(zip_buffer, 'w') as zipf:
         if n_err > 0:
