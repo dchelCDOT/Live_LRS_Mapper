@@ -590,16 +590,19 @@ if st.session_state['processed']:
                     p_url = st.text_input("Portal URL", key="portal_url")
                     p_user = st.text_input("Username")
                     p_pass = st.text_input("Password", type="password")
+                    disable_ssl = st.checkbox("Disable SSL Verification (Fix for some Enterprise Portals)")
                     
                     if st.button("Connect"):
                         try:
-                            gis = GIS(p_url, p_user, p_pass)
+                            # Use SSL toggle
+                            gis = GIS(p_url, p_user, p_pass, verify_cert=not disable_ssl)
                             st.session_state['gis'] = gis
                             st.session_state['agol_creds'] = (p_url, p_user, p_pass)
                             
-                            # Fetch Content
+                            # Fetch Content (Using Search instead of .items)
                             with st.spinner("Fetching your content..."):
-                                user_content = gis.users.me.items(item_type="Feature Layer Collection", max_items=100)
+                                query = f"owner:{p_user} AND type:\"Feature Service\""
+                                user_content = gis.content.search(query=query, max_items=100)
                                 st.session_state['user_layers'] = {f"{item.title} ({item.id})": item.id for item in user_content}
                             st.success(f"Connected as {gis.users.me.username}")
                             st.rerun()
