@@ -20,7 +20,6 @@ try:
     import arcgis.features.geo
     
     # --- MONKEY PATCH FOR 'is_geoenabled' ERROR ---
-    # Fixes compatibility issues between arcgis and pandas versions
     if not hasattr(arcgis.features.geo, '_is_geoenabled'):
         def _is_geoenabled(df):
             return hasattr(df, 'spatial')
@@ -30,7 +29,6 @@ try:
 except ImportError:
     ARCGIS_AVAILABLE = False
 except Exception:
-    # Fallback if patching fails, but usually allows import to proceed
     ARCGIS_AVAILABLE = True 
 
 # --- PAGE CONFIG ---
@@ -69,6 +67,13 @@ st.markdown(f"""
         div.stButton > button:first-child:hover {{
             background-color: {CDOT_BLUE}; border: 2px solid {CDOT_GREEN};
         }}
+        .warning-box {{
+            background-color: #fff3cd;
+            border-left: 5px solid #ffc107;
+            padding: 15px;
+            margin-bottom: 15px;
+            color: #856404;
+        }}
     </style>
 """, unsafe_allow_html=True)
 
@@ -92,7 +97,7 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         * **Smart Validation:** Checks MP limits against the official CDOT Reference table.
         * **Offset Correction:** Correctly handles routes that do not start at MP 0.
         * **Resampling Engine:** Generates valid lines even on broken/complex GIS topology.
-        * **Portal Upload:** Publish/Overwrite layers to ArcGIS Online or GeoHub.
+        * **Portal Upload:** Publish/Overwrite layers to ArcGIS Online or GeoHub using GeoPackages.
         """)
     with col_how:
         st.subheader("How to use it")
@@ -117,7 +122,6 @@ if 'error_df' not in st.session_state: st.session_state['error_df'] = None
 if 'processed' not in st.session_state: st.session_state['processed'] = False
 if 'gis' not in st.session_state: st.session_state['gis'] = None
 if 'user_layers' not in st.session_state: st.session_state['user_layers'] = {}
-# Initialize URL state if not present
 if 'portal_url' not in st.session_state: st.session_state['portal_url'] = "https://maps.codot.gov/portal/"
 
 # --- UTILS ---
@@ -168,83 +172,82 @@ def get_reference_data(url):
         return None
     except: return None
 
-# --- ARCGIS PUBLISH/OVERWRITE UTILS ---
-def prep_shapefile_zip(data_list, layer_title):
-    """Saves data to a zipped shapefile for upload."""
-    if not data_list: return None
+# --- EXPORT UTILS ---
+def prep_geopackage_zip(data_list, layer_title):
+    if not data_list: return None, []
     
-    # Clean Geometry
     valid_data = [d for d in data_list if d.get('geometry') is not None]
-    if not valid_data: return None
+    if not valid_data: return None, []
     
-    # Create GDF
     gdf = gpd.GeoDataFrame(valid_data, crs=CALC_CRS).to_crs(MAP_CRS)
     for col in gdf.columns:
         if pd.api.types.is_datetime64_any_dtype(gdf[col]):
             gdf[col] = gdf[col].astype(str)
             
-    # Temp Dir
     temp_dir = f"/tmp/upload_{layer_title}"
     if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
     os.makedirs(temp_dir)
     
-    # Save & Zip
-    gdf.to_file(os.path.join(temp_dir, f"{layer_title}.shp"))
+    gpkg_name = f"{layer_title}.gpkg"
+    gdf.to_file(os.path.join(temp_dir, gpkg_name), driver="GPKG")
     
     zip_path = f"/tmp/{layer_title}.zip"
     with ZipFile(zip_path, 'w') as zipf:
-        for f in os.listdir(temp_dir):
-            if f.endswith(('.shp', '.shx', '.dbf', '.prj', '.cpg')):
-                zipf.write(os.path.join(temp_dir, f), f)
+        zipf.write(os.path.join(temp_dir, gpkg_name), gpkg_name)
                 
-    return zip_path
+    return zip_path, list(gdf.columns)
 
-def handle_arcgis_upload(gis, zip_path, layer_title, folder_name, overwrite_item_id=None):
-    """Handles logic for publishing new OR overwriting specific item."""
+def handle_arcgis_upload(gis, zip_path, layer_title, folder_name, item_props, overwrite_item_id=None):
     try:
         if overwrite_item_id:
-            # OVERWRITE LOGIC
             item = gis.content.get(overwrite_item_id)
             if not item: return "ERROR", "Target Item not found."
             
             flc = FeatureLayerCollection.fromitem(item)
             flc.manager.overwrite(zip_path)
+            if item_props: item.update(item_properties=item_props)
             return "OVERWRITTEN", item.homepage
         else:
-            # PUBLISH NEW
             query = f"title:\"{layer_title}\" AND owner:\"{gis.users.me.username}\" AND type:\"Feature Service\""
             search_res = gis.content.search(query=query, max_items=1)
             
-            if search_res:
-                return "EXISTS", search_res[0].homepage
+            if search_res: return "EXISTS", search_res[0].homepage
 
-            item_props = {'type': 'Shapefile', 'title': layer_title, 'tags': 'CDOT, LRS'}
-            shp_item = gis.content.add(item_props, data=zip_path, folder=folder_name)
+            final_props = {'type': 'GeoPackage', 'title': layer_title, 'tags': 'CDOT, LRS'}
+            if item_props: final_props.update(item_props)
+            
+            shp_item = gis.content.add(final_props, data=zip_path, folder=folder_name)
             feat_item = shp_item.publish()
             return "PUBLISHED", feat_item.homepage
-            
     except Exception as e:
         return "ERROR", str(e)
 
+def check_schema_match(gis, item_id, new_columns):
+    try:
+        item = gis.content.get(item_id)
+        if not item or not item.layers: return "UNKNOWN", []
+        existing_fields = [f['name'] for f in item.layers[0].properties.fields]
+        missing_cols = [col for col in existing_fields if col not in new_columns and col.lower() not in ['fid', 'objectid', 'shape', 'globalid']]
+        return "MATCH" if not missing_cols else "MISMATCH", missing_cols
+    except:
+        return "UNKNOWN", []
+
 def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
-    # Unpack columns
     rid_col = col_map['rid']
     bm_col = col_map['bm']
     em_col = col_map['em']
     gis_rid = col_map['gis_rid']
     
-    # Ensure string matching
     routes[gis_rid] = routes[gis_rid].astype(str)
     df_batch[rid_col] = df_batch[rid_col].astype(str)
     
     v_pts, v_lns, errs = [], [], []
-    unit_factor = 1609.34 # Miles to Meters
+    unit_factor = 1609.34
     
     for idx, row in df_batch.iterrows():
         try:
             rid = str(row[rid_col]).strip()
             
-            # --- 1. REFERENCE VALIDATION ---
             route_min_mp = 0.0
             if ref_lookup and rid in ref_lookup:
                 limits = ref_lookup[rid]
@@ -266,7 +269,6 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                          if em_val > (limits['max'] + 0.1): 
                              raise ValueError(f"End MP ({em_val}) exceeds Route {rid} Maximum ({limits['max']})")
 
-            # --- 2. GIS PROCESSING ---
             matches = routes[routes[gis_rid] == rid]
             if matches.empty:
                 raise ValueError(f"Route ID '{rid}' Not Found in GIS Network")
@@ -282,7 +284,6 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             
             final_geom = None
             
-            # --- ITERATE SEGMENTS ---
             for _, feat in matches.iterrows():
                 geom = feat.geometry
                 
@@ -552,37 +553,76 @@ if st.session_state['processed']:
     
     with col_dl:
         st.write("##### 💾 Download Local Files")
-        st.write("Download mapped results as Shapefiles.")
-        zip_buffer = io.BytesIO()
-        with ZipFile(zip_buffer, 'w') as zipf:
-            if n_err > 0:
-                csv_data = st.session_state['error_df'].to_csv(index=False)
-                zipf.writestr("Remaining_Errors.csv", csv_data)
-            
-            def save_shp(data, suffix):
-                valid_data = [d for d in data if d.get('geometry') is not None]
-                if not valid_data: return
-                tmp_gdf = gpd.GeoDataFrame(valid_data, crs=CALC_CRS).to_crs(MAP_CRS)
-                for col in tmp_gdf.columns:
-                    if tmp_gdf[col].dtype == 'object': tmp_gdf[col] = tmp_gdf[col].astype(str)
-                name = f"{out_name}_{suffix}"
-                path = f"/tmp/{name}.shp"
-                tmp_gdf.to_file(path)
-                for f in os.listdir("/tmp"):
-                    if f.startswith(name):
-                        zipf.write(os.path.join("/tmp", f), f)
-                        os.remove(os.path.join("/tmp", f))
+        dl_fmt = st.radio("Format:", ["Shapefile (ZIP)", "GeoPackage (.gpkg)"], horizontal=True)
+        
+        # --- DOWNLOAD HANDLER ---
+        file_ready = False
+        dl_data = None
+        dl_name = ""
+        dl_mime = ""
+        
+        if dl_fmt == "Shapefile (ZIP)":
+            zip_buffer = io.BytesIO()
+            with ZipFile(zip_buffer, 'w') as zipf:
+                if n_err > 0:
+                    csv_data = st.session_state['error_df'].to_csv(index=False)
+                    zipf.writestr("Remaining_Errors.csv", csv_data)
+                
+                def save_shp(data, suffix):
+                    valid_data = [d for d in data if d.get('geometry') is not None]
+                    if not valid_data: return
+                    tmp_gdf = gpd.GeoDataFrame(valid_data, crs=CALC_CRS).to_crs(MAP_CRS)
+                    for col in tmp_gdf.columns:
+                        if tmp_gdf[col].dtype == 'object': tmp_gdf[col] = tmp_gdf[col].astype(str)
+                    name = f"{out_name}_{suffix}"
+                    path = f"/tmp/{name}.shp"
+                    tmp_gdf.to_file(path)
+                    for f in os.listdir("/tmp"):
+                        if f.startswith(name):
+                            zipf.write(os.path.join("/tmp", f), f)
+                            os.remove(os.path.join("/tmp", f))
 
-            save_shp(st.session_state['success_pts'], "Points")
-            save_shp(st.session_state['success_lns'], "Lines")
+                save_shp(st.session_state['success_pts'], "Points")
+                save_shp(st.session_state['success_lns'], "Lines")
             
-        st.download_button(
-            label=f"📦 Download ZIP ({out_name}.zip)",
-            data=zip_buffer.getvalue(),
-            file_name=f"{out_name}.zip",
-            mime="application/zip",
-            type="primary"
-        )
+            dl_data = zip_buffer.getvalue()
+            dl_name = f"{out_name}.zip"
+            dl_mime = "application/zip"
+            file_ready = True
+            
+        elif dl_fmt == "GeoPackage (.gpkg)":
+            gpkg_path = f"/tmp/{out_name}.gpkg"
+            if os.path.exists(gpkg_path): os.remove(gpkg_path)
+            
+            has_layers = False
+            if n_pts > 0:
+                valid_pts = [d for d in st.session_state['success_pts'] if d.get('geometry') is not None]
+                if valid_pts:
+                    gpd.GeoDataFrame(valid_pts, crs=CALC_CRS).to_crs(MAP_CRS).to_file(gpkg_path, layer="Points", driver="GPKG")
+                    has_layers = True
+            
+            if n_lns > 0:
+                valid_lns = [d for d in st.session_state['success_lns'] if d.get('geometry') is not None]
+                if valid_lns:
+                    mode = 'a' if has_layers else 'w'
+                    gpd.GeoDataFrame(valid_lns, crs=CALC_CRS).to_crs(MAP_CRS).to_file(gpkg_path, layer="Lines", driver="GPKG", mode=mode)
+                    has_layers = True
+            
+            if has_layers:
+                with open(gpkg_path, "rb") as f:
+                    dl_data = f.read()
+                dl_name = f"{out_name}.gpkg"
+                dl_mime = "application/octet-stream"
+                file_ready = True
+
+        if file_ready:
+            st.download_button(
+                label=f"📦 Download {dl_fmt}",
+                data=dl_data,
+                file_name=dl_name,
+                mime=dl_mime,
+                type="primary"
+            )
 
     with col_ul:
         if ARCGIS_AVAILABLE:
@@ -591,7 +631,6 @@ if st.session_state['processed']:
                 if st.session_state['gis'] is None:
                     st.warning("Please Login to proceed.")
                     
-                    # Callback to update URL
                     def update_portal_url():
                         if st.session_state.portal_type_selector == "ArcGIS Online":
                             st.session_state.portal_url = "https://www.arcgis.com"
@@ -606,12 +645,10 @@ if st.session_state['processed']:
                     
                     if st.button("Connect"):
                         try:
-                            # Use SSL toggle
                             gis = GIS(p_url, p_user, p_pass, verify_cert=not disable_ssl)
                             st.session_state['gis'] = gis
                             st.session_state['agol_creds'] = (p_url, p_user, p_pass)
                             
-                            # Fetch Content (Using SEARCH for robustness)
                             with st.spinner("Fetching your content..."):
                                 query = f"owner:{p_user} AND type:\"Feature Service\""
                                 user_content = gis.content.search(query=query, max_items=100)
@@ -621,7 +658,7 @@ if st.session_state['processed']:
                         except Exception as e:
                             st.error(f"Login Failed: {e}")
                 
-                # UPLOAD UI (Only if logged in)
+                # UPLOAD UI
                 else:
                     gis = st.session_state['gis']
                     st.success(f"Logged in as: **{gis.users.me.username}**")
@@ -631,41 +668,70 @@ if st.session_state['processed']:
                     
                     st.divider()
                     
-                    # 1. Choose Upload Mode
                     up_mode = st.radio("Upload Mode", ["New Layer", "Overwrite Existing"], horizontal=True)
                     
                     target_item_id = None
                     up_name = ""
+                    item_props = {}
+                    ready_to_upload = False
                     
                     if up_mode == "New Layer":
                         up_name = st.text_input("New Layer Name", f"{out_name}_LRS")
+                        up_tags = st.text_input("Tags (comma separated)", "CDOT, LRS")
+                        up_summary = st.text_area("Summary (Abstract)", "Generated by CDOT LRS Mapper")
                         up_folder = st.text_input("Folder (Optional)")
+                        
+                        item_props = {
+                            'tags': up_tags, 
+                            'snippet': up_summary
+                        }
+                        ready_to_upload = True
+                        
                     else:
-                        # OVERWRITE MODE - Select from User Layers
+                        # OVERWRITE MODE
+                        st.markdown('<div class="warning-box">⚠️ <b>DANGER ZONE:</b> Overwriting replaces the entire dataset. This can break maps, dashboards, and apps that rely on specific field names or data.</div>', unsafe_allow_html=True)
+                        
                         if st.session_state['user_layers']:
                             selected_layer_key = st.selectbox("Select Layer to Overwrite", list(st.session_state['user_layers'].keys()))
                             target_item_id = st.session_state['user_layers'][selected_layer_key]
-                            up_name = selected_layer_key.split(" (")[0] # Just for labeling
+                            up_name = selected_layer_key.split(" (")[0]
                             up_folder = None
+                            
+                            # Pre-check schema
+                            if n_lns > 0 or n_pts > 0:
+                                sample_data = st.session_state['success_lns'] if n_lns > 0 else st.session_state['success_pts']
+                                zip_path_check, new_cols = prep_geopackage_zip(sample_data, "schema_check")
+                                
+                                status, missing = check_schema_match(gis, target_item_id, new_cols)
+                                
+                                if status == "MISMATCH":
+                                    st.error(f"❌ **SCHEMA MISMATCH DETECTED**")
+                                    st.write(f"The new dataset is missing these fields found in the existing layer: **{', '.join(missing)}**")
+                                    st.write("Overwriting now will delete these fields and likely break downstream applications.")
+                                else:
+                                    st.success("✅ New schema appears compatible (all existing fields present).")
+                            
+                            ack = st.checkbox("⚠️ I acknowledge that overwriting is permanent and may break dependent apps.")
+                            if ack:
+                                ready_to_upload = True
                         else:
                             st.warning("No Feature Layers found in your content.")
-                            up_mode = "Disabled"
 
-                    if st.button("Upload & Publish") and up_mode != "Disabled":
+                    if st.button("Upload & Publish", disabled=not ready_to_upload):
                         with st.spinner("Processing Upload..."):
                             
                             if n_pts > 0:
-                                zip_path = prep_shapefile_zip(st.session_state['success_pts'], f"{up_name}_Points")
+                                zip_path, _ = prep_geopackage_zip(st.session_state['success_pts'], f"{up_name}_Points")
                                 if zip_path:
-                                    status, msg = handle_arcgis_upload(gis, zip_path, f"{up_name}_Points", up_folder, target_item_id)
+                                    status, msg = handle_arcgis_upload(gis, zip_path, f"{up_name}_Points", up_folder, item_props, target_item_id)
                                     if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Points {status}: [View Item]({msg})")
                                     elif status == "EXISTS": st.warning(f"Layer '{up_name}_Points' already exists. Use 'Overwrite Existing' mode.")
                                     else: st.error(f"Points Error: {msg}")
                                 
                             if n_lns > 0:
-                                zip_path = prep_shapefile_zip(st.session_state['success_lns'], f"{up_name}_Lines")
+                                zip_path, _ = prep_geopackage_zip(st.session_state['success_lns'], f"{up_name}_Lines")
                                 if zip_path:
-                                    status, msg = handle_arcgis_upload(gis, zip_path, f"{up_name}_Lines", up_folder, target_item_id)
+                                    status, msg = handle_arcgis_upload(gis, zip_path, f"{up_name}_Lines", up_folder, item_props, target_item_id)
                                     if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Lines {status}: [View Item]({msg})")
                                     elif status == "EXISTS": st.warning(f"Layer '{up_name}_Lines' already exists. Use 'Overwrite Existing' mode.")
                                     else: st.error(f"Lines Error: {msg}")
