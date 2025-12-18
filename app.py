@@ -9,15 +9,24 @@ from streamlit_folium import st_folium
 import requests
 import io
 import os
+import shutil
 import numpy as np 
 from zipfile import ZipFile
+
+# --- ARCGIS LIBRARY CHECK ---
+try:
+    from arcgis.gis import GIS
+    from arcgis.features import FeatureLayerCollection
+    ARCGIS_AVAILABLE = True
+except ImportError:
+    ARCGIS_AVAILABLE = False
 
 # --- PAGE CONFIG ---
 st.set_page_config(
     page_title="CDOT Route and Reference Mapper",
     page_icon="🛣️",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 # --- BRANDING CONSTANTS ---
@@ -71,15 +80,15 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         * **Smart Validation:** Checks MP limits against the official CDOT Reference table.
         * **Offset Correction:** Correctly handles routes that do not start at MP 0.
         * **Resampling Engine:** Generates valid lines even on broken/complex GIS topology.
+        * **Portal Upload:** Publish/Overwrite layers to ArcGIS Online or GeoHub.
         """)
     with col_how:
         st.subheader("How to use it")
         st.markdown("""
         1.  **Upload** your CSV or Excel file.
         2.  **Map Columns** (Route ID, Begin MP, End MP).
-        3.  **Run Analysis**.
-        4.  **Fix Errors** (if any) in the table that appears.
-        5.  **Download** Shapefiles and Error Reports.
+        3.  **Run Analysis** & Fix Errors.
+        4.  **Download** results OR **Login** (sidebar) to upload to GeoHub/AGOL.
         """)
 
 st.divider()
@@ -94,6 +103,8 @@ if 'success_pts' not in st.session_state: st.session_state['success_pts'] = []
 if 'success_lns' not in st.session_state: st.session_state['success_lns'] = []
 if 'error_df' not in st.session_state: st.session_state['error_df'] = None
 if 'processed' not in st.session_state: st.session_state['processed'] = False
+if 'gis' not in st.session_state: st.session_state['gis'] = None
+if 'user_layers' not in st.session_state: st.session_state['user_layers'] = {}
 
 # --- UTILS ---
 @st.cache_data
@@ -143,6 +154,67 @@ def get_reference_data(url):
         return None
     except: return None
 
+# --- ARCGIS PUBLISH/OVERWRITE UTILS ---
+def prep_shapefile_zip(data_list, layer_title):
+    """Saves data to a zipped shapefile for upload."""
+    if not data_list: return None
+    
+    # Clean Geometry
+    valid_data = [d for d in data_list if d.get('geometry') is not None]
+    if not valid_data: return None
+    
+    # Create GDF
+    gdf = gpd.GeoDataFrame(valid_data, crs=CALC_CRS).to_crs(MAP_CRS)
+    for col in gdf.columns:
+        if pd.api.types.is_datetime64_any_dtype(gdf[col]):
+            gdf[col] = gdf[col].astype(str)
+            
+    # Temp Dir
+    temp_dir = f"/tmp/upload_{layer_title}"
+    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
+    
+    # Save & Zip
+    gdf.to_file(os.path.join(temp_dir, f"{layer_title}.shp"))
+    
+    zip_path = f"/tmp/{layer_title}.zip"
+    with ZipFile(zip_path, 'w') as zipf:
+        for f in os.listdir(temp_dir):
+            if f.endswith(('.shp', '.shx', '.dbf', '.prj', '.cpg')):
+                zipf.write(os.path.join(temp_dir, f), f)
+                
+    return zip_path
+
+def handle_arcgis_upload(gis, zip_path, layer_title, folder_name, overwrite_item_id=None):
+    """Handles logic for publishing new OR overwriting specific item."""
+    try:
+        if overwrite_item_id:
+            # OVERWRITE LOGIC (Directly targeting selected item)
+            item = gis.content.get(overwrite_item_id)
+            if not item: return "ERROR", "Target Item not found."
+            
+            flc = FeatureLayerCollection.fromitem(item)
+            flc.manager.overwrite(zip_path)
+            return "OVERWRITTEN", item.homepage
+        else:
+            # PUBLISH NEW
+            # Check for existing name collision first
+            query = f"title:\"{layer_title}\" AND owner:\"{gis.users.me.username}\" AND type:\"Feature Service\""
+            search_res = gis.content.search(query=query, max_items=1)
+            
+            if search_res:
+                return "EXISTS", search_res[0].homepage
+
+            # Add Shapefile Item
+            item_props = {'type': 'Shapefile', 'title': layer_title, 'tags': 'CDOT, LRS'}
+            shp_item = gis.content.add(item_props, data=zip_path, folder=folder_name)
+            # Publish
+            feat_item = shp_item.publish()
+            return "PUBLISHED", feat_item.homepage
+            
+    except Exception as e:
+        return "ERROR", str(e)
+
 def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
     # Unpack columns
     rid_col = col_map['rid']
@@ -162,20 +234,16 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             rid = str(row[rid_col]).strip()
             
             # --- 1. REFERENCE VALIDATION ---
-            route_min_mp = 0.0 # Default if no ref found
-            
+            route_min_mp = 0.0
             if ref_lookup and rid in ref_lookup:
                 limits = ref_lookup[rid]
-                route_min_mp = limits['min'] # Capture the START MP
+                route_min_mp = limits['min'] 
                 
                 try: bm_val = float(row[bm_col])
                 except: raise ValueError(f"Invalid Begin Measure format: {row[bm_col]}")
                 
-                # Check Min
                 if bm_val < limits['min']:
                     raise ValueError(f"Begin MP ({bm_val}) is below Route {rid} Minimum ({limits['min']})")
-                
-                # Check Max 
                 if bm_val > limits['max']:
                     raise ValueError(f"Begin MP ({bm_val}) exceeds Route {rid} Maximum ({limits['max']})")
                 
@@ -192,11 +260,9 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             if matches.empty:
                 raise ValueError(f"Route ID '{rid}' Not Found in GIS Network")
             
-            # --- PARSE INPUTS ---
             try: bm_val = float(row[bm_col])
             except: raise ValueError(f"Invalid Begin Measure: {row[bm_col]}")
             
-            # --- DETERMINE MODE ---
             is_point = False
             if mode == 'Point': is_point = True
             elif mode == 'Line': is_point = False
@@ -209,31 +275,22 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             for _, feat in matches.iterrows():
                 geom = feat.geometry
                 
-                # TOPOLOGY FIX: Merge MultiLineStrings
                 if geom.geom_type == 'MultiLineString':
                     merged = linemerge(geom)
                     if merged.geom_type in ['LineString', 'MultiLineString']:
                         geom = merged
                 
-                # --- OFFSET CORRECTION ---
-                # We subtract the Route Min MP from the input MP to get distance from start of line
-                # E.g. If route starts at MP 10, and we want MP 12 -> 12 - 10 = 2 miles in.
-                
-                # Safety: ensure we don't get negative distance
                 relative_bm = max(0.0, bm_val - route_min_mp)
                 bm_meters = relative_bm * unit_factor
                 
                 if is_point:
-                    # Point Logic
                     if bm_meters <= geom.length:
                         final_geom = geom.interpolate(bm_meters)
                         break
                 else:
-                    # Line Logic
                     try: em_val = float(row[em_col])
                     except: raise ValueError(f"Invalid End Measure: {row.get(em_col)}")
                     
-                    # Offset End MP as well
                     relative_em = max(0.0, em_val - route_min_mp)
                     em_meters = relative_em * unit_factor
                     
@@ -241,25 +298,20 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                         if bm_meters == em_meters: raise ValueError("Begin MP == End MP (Use Point mode)")
                         else: raise ValueError(f"End MP ({em_val}) < Begin MP ({bm_val})")
                     
-                    # 1. Try Standard Substring
                     try:
                         candidate_ln = substring(geom, bm_meters, em_meters)
                         if not candidate_ln.is_empty and candidate_ln.geom_type in ['LineString', 'MultiLineString'] and candidate_ln.length > 0.1:
                             final_geom = candidate_ln
                             break 
-                    except:
-                        pass
+                    except: pass
                     
-                    # 2. RESAMPLING FALLBACK
                     if bm_meters < (geom.length + 50): 
                          actual_end_m = min(em_meters, geom.length)
                          actual_start_m = min(bm_meters, geom.length)
                          
                          if actual_end_m > actual_start_m:
-                             # 10m Resolution
                              segment_len = actual_end_m - actual_start_m
-                             num_points = max(2, int(segment_len / 10)) 
-                             
+                             num_points = max(2, int(segment_len / 10))
                              distances = np.linspace(actual_start_m, actual_end_m, num=num_points)
                              points = [geom.interpolate(d) for d in distances]
                              
@@ -267,10 +319,8 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                                  final_geom = LineString(points)
                                  break 
 
-            # --- ERROR HANDLING ---
             if final_geom is None:
                  if is_point:
-                     # Fallback clamp to end of last segment
                      last_geom = matches.iloc[-1].geometry
                      if (bm_val - route_min_mp) * unit_factor > last_geom.length:
                          final_geom = last_geom.interpolate(last_geom.length)
@@ -292,13 +342,48 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             
     return v_pts, v_lns, errs
 
+# --- SIDEBAR: LOGIN & CONTENT FETCH ---
+with st.sidebar:
+    st.write("### ☁️ Upload Login (Optional)")
+    st.caption("Login to publish results to your Portal. This is not required to use the mapping tools.")
+    
+    if ARCGIS_AVAILABLE:
+        with st.form("agol_login"):
+            portal_type = st.selectbox("Destination Portal", ["ArcGIS Online", "GeoHub (Enterprise)"])
+            
+            if portal_type == "ArcGIS Online":
+                default_url = "https://www.arcgis.com"
+            else:
+                default_url = "https://maps.codot.gov/portal/"
+            
+            agol_url = st.text_input("Portal URL", default_url)
+            agol_user = st.text_input("Username")
+            agol_pass = st.text_input("Password", type="password")
+            
+            agol_btn = st.form_submit_button("Authenticate")
+        
+        if agol_btn and agol_user and agol_pass:
+            try:
+                gis = GIS(agol_url, agol_user, agol_pass)
+                st.session_state['gis'] = gis
+                st.session_state['agol_creds'] = (agol_url, agol_user, agol_pass)
+                
+                # --- AUTO-FETCH USER CONTENT ---
+                user_content = gis.users.me.items(item_type="Feature Layer Collection", max_items=100)
+                # Store as dict: {"Title (ID)": "ItemID"}
+                st.session_state['user_layers'] = {f"{item.title} ({item.id})": item.id for item in user_content}
+                
+                st.success(f"✅ Connected as {gis.users.me.username}. Found {len(user_content)} layers.")
+                
+            except Exception as e:
+                st.error(f"Login failed: {e}")
+    else:
+        st.warning("⚠️ 'arcgis' Python library not found. Upload disabled.")
+
 # --- UI SECTION 1: UPLOAD ---
 st.subheader("1. Data Upload")
-st.info(f"**Need help formatting?** Use our [Highway Route & Reference Mapping Toolbox]({'https://script.google.com/a/macros/state.co.us/s/AKfycbxNe4UVfAAngo5W0M_fTrduePeip-yW4zbGRm6NIjNY-87rQy3D86jshHVBUXpPxb5p7A/exec'}).")
-
 uploaded_file = st.file_uploader("Upload Data (.csv or .xlsx)", type=["csv", "xlsx"])
 
-# --- LOAD DATA ---
 df_main = None
 if uploaded_file:
     try:
@@ -340,14 +425,12 @@ if df_main is not None:
         st.write("")
         ignore_errors = st.checkbox("Ignore rows with mapping errors to allow valid rows to map", value=True)
 
-    # --- EMPTY ROW CLEANING ---
     before_len = len(df_main)
     df_main = df_main.dropna(subset=[rid_col, bm_col], how='any')
     if len(df_main) > 0:
         mask = df_main[rid_col].astype(str).str.strip() == ''
         df_main = df_main[~mask]
     
-    # --- ACTION BUTTONS ---
     st.divider()
     
     if st.button("🚀 Run Analysis", type="primary"):
@@ -355,16 +438,13 @@ if df_main is not None:
         st.session_state['success_lns'] = []
         st.session_state['error_df'] = None
         
-        # Load GIS
         raw_routes = get_arcgis_features(ROUTE_SERVICE_URL)
         if raw_routes is None: st.stop()
         routes = raw_routes.to_crs(CALC_CRS)
         
-        # Load Reference Data
         with st.spinner("Loading Official Route Limits..."):
             ref_lookup = get_reference_data(REF_SHEET_URL)
         
-        # Detect GIS Column
         gis_rid = None
         for c in routes.columns:
             if c.upper() in ['ROUTE', 'ROUTEID', 'RTEID', 'ROUTE_ID']:
@@ -384,7 +464,6 @@ if df_main is not None:
             st.session_state['success_lns'] = lns
             if errs:
                 err_df = pd.DataFrame(errs)
-                # Auto-sort errors
                 err_df = err_df.sort_values('Error_Message')
                 cols = list(err_df.columns)
                 cols.insert(0, cols.pop(cols.index('Error_Message')))
@@ -392,7 +471,7 @@ if df_main is not None:
                 
         st.session_state['processed'] = True
 
-# --- UI SECTION 3: RESULTS & FIXING ---
+# --- UI SECTION 3: RESULTS ---
 if st.session_state['processed']:
     
     if st.session_state['error_df'] is not None and not st.session_state['error_df'].empty:
@@ -492,33 +571,84 @@ if st.session_state['processed']:
     folium.LayerControl().add_to(m)
     st_folium(m, width=1000, height=600)
     
-    zip_buffer = io.BytesIO()
-    with ZipFile(zip_buffer, 'w') as zipf:
-        if n_err > 0:
-            csv_data = st.session_state['error_df'].to_csv(index=False)
-            zipf.writestr("Remaining_Errors.csv", csv_data)
-        
-        def save_shp(data, suffix):
-            valid_data = [d for d in data if d.get('geometry') is not None]
-            if not valid_data: return
-            tmp_gdf = gpd.GeoDataFrame(valid_data, crs=CALC_CRS).to_crs(MAP_CRS)
-            for col in tmp_gdf.columns:
-                if tmp_gdf[col].dtype == 'object': tmp_gdf[col] = tmp_gdf[col].astype(str)
-            name = f"{out_name}_{suffix}"
-            path = f"/tmp/{name}.shp"
-            tmp_gdf.to_file(path)
-            for f in os.listdir("/tmp"):
-                if f.startswith(name):
-                    zipf.write(os.path.join("/tmp", f), f)
-                    os.remove(os.path.join("/tmp", f))
+    # --- DOWNLOAD & UPLOAD SECTION ---
+    col_dl, col_ul = st.columns(2)
+    
+    with col_dl:
+        zip_buffer = io.BytesIO()
+        with ZipFile(zip_buffer, 'w') as zipf:
+            if n_err > 0:
+                csv_data = st.session_state['error_df'].to_csv(index=False)
+                zipf.writestr("Remaining_Errors.csv", csv_data)
+            
+            def save_shp(data, suffix):
+                valid_data = [d for d in data if d.get('geometry') is not None]
+                if not valid_data: return
+                tmp_gdf = gpd.GeoDataFrame(valid_data, crs=CALC_CRS).to_crs(MAP_CRS)
+                for col in tmp_gdf.columns:
+                    if tmp_gdf[col].dtype == 'object': tmp_gdf[col] = tmp_gdf[col].astype(str)
+                name = f"{out_name}_{suffix}"
+                path = f"/tmp/{name}.shp"
+                tmp_gdf.to_file(path)
+                for f in os.listdir("/tmp"):
+                    if f.startswith(name):
+                        zipf.write(os.path.join("/tmp", f), f)
+                        os.remove(os.path.join("/tmp", f))
 
-        save_shp(st.session_state['success_pts'], "Points")
-        save_shp(st.session_state['success_lns'], "Lines")
-        
-    st.download_button(
-        label=f"📦 Download ZIP ({out_name}.zip)",
-        data=zip_buffer.getvalue(),
-        file_name=f"{out_name}.zip",
-        mime="application/zip",
-        type="primary"
-    )
+            save_shp(st.session_state['success_pts'], "Points")
+            save_shp(st.session_state['success_lns'], "Lines")
+            
+        st.download_button(
+            label=f"📦 Download ZIP ({out_name}.zip)",
+            data=zip_buffer.getvalue(),
+            file_name=f"{out_name}.zip",
+            mime="application/zip",
+            type="primary"
+        )
+
+    with col_ul:
+        if 'gis' in st.session_state:
+            st.write("#### ☁️ Publish to Portal")
+            
+            # 1. Choose Upload Mode
+            up_mode = st.radio("Upload Mode", ["New Layer", "Overwrite Existing"], horizontal=True)
+            
+            target_item_id = None
+            
+            if up_mode == "New Layer":
+                up_name = st.text_input("New Layer Name", f"{out_name}_LRS")
+                up_folder = st.text_input("Folder (Optional)")
+            else:
+                # OVERWRITE MODE - Select from User Layers
+                if st.session_state['user_layers']:
+                    selected_layer_key = st.selectbox("Select Layer to Overwrite", list(st.session_state['user_layers'].keys()))
+                    target_item_id = st.session_state['user_layers'][selected_layer_key]
+                    up_name = selected_layer_key # Just for labeling
+                    up_folder = None
+                else:
+                    st.warning("No Feature Layers found in your content.")
+                    up_mode = "Disabled"
+
+            if st.button("Upload & Publish") and up_mode != "Disabled":
+                with st.spinner("Processing Upload..."):
+                    # Retrieve creds
+                    url, user, pwd = st.session_state.get('agol_creds')
+                    gis_obj = st.session_state['gis']
+                    
+                    if n_pts > 0:
+                        zip_path = prep_shapefile_zip(st.session_state['success_pts'], f"{out_name}_Points")
+                        if zip_path:
+                            status, msg = handle_arcgis_upload(gis_obj, zip_path, f"{up_name}_Points", up_folder, target_item_id)
+                            if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Points {status}: [View Item]({msg})")
+                            elif status == "EXISTS": st.warning(f"Layer '{up_name}_Points' already exists. Use 'Overwrite Existing' mode.")
+                            else: st.error(f"Points Error: {msg}")
+                        
+                    if n_lns > 0:
+                        zip_path = prep_shapefile_zip(st.session_state['success_lns'], f"{out_name}_Lines")
+                        if zip_path:
+                            status, msg = handle_arcgis_upload(gis_obj, zip_path, f"{up_name}_Lines", up_folder, target_item_id)
+                            if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Lines {status}: [View Item]({msg})")
+                            elif status == "EXISTS": st.warning(f"Layer '{up_name}_Lines' already exists. Use 'Overwrite Existing' mode.")
+                            else: st.error(f"Lines Error: {msg}")
+        else:
+            st.info("Login via Sidebar to enable ArcGIS/GeoHub Upload.")
