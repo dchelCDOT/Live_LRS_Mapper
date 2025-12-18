@@ -215,7 +215,7 @@ def process_batch(df_batch, routes, col_map, mode):
 
 # --- UI SECTION 1: UPLOAD ---
 st.subheader("1. Data Upload")
-st.info(f"**Need help formatting?** Use our [Google Sheets Tool]({'https://script.google.com/a/macros/state.co.us/s/AKfycbxNe4UVfAAngo5W0M_fTrduePeip-yW4zbGRm6NIjNY-87rQy3D86jshHVBUXpPxb5p7A/exec'}).")
+st.info(f"**Need help formatting?** Use our [Highway Route & Reference Mapping Toolbox]({'https://script.google.com/a/macros/state.co.us/s/AKfycbxNe4UVfAAngo5W0M_fTrduePeip-yW4zbGRm6NIjNY-87rQy3D86jshHVBUXpPxb5p7A/exec'}).")
 
 uploaded_file = st.file_uploader("Upload .csv or .xlsx", type=["csv", "xlsx"])
 
@@ -423,3 +423,4 @@ if st.session_state['processed']:
         mime="application/zip",
         type="primary"
     )
+
