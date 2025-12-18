@@ -121,7 +121,8 @@ if 'success_lns' not in st.session_state: st.session_state['success_lns'] = []
 if 'error_df' not in st.session_state: st.session_state['error_df'] = None
 if 'processed' not in st.session_state: st.session_state['processed'] = False
 if 'gis' not in st.session_state: st.session_state['gis'] = None
-if 'user_layers' not in st.session_state: st.session_state['user_layers'] = {}
+if 'user_layers' not in st.session_state: st.session_state['user_layers'] = []
+if 'user_folders' not in st.session_state: st.session_state['user_folders'] = []
 if 'portal_url' not in st.session_state: st.session_state['portal_url'] = "https://maps.codot.gov/portal/"
 
 # --- UTILS ---
@@ -188,10 +189,9 @@ def prep_geopackage_zip(data_list, layer_title):
     if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
     os.makedirs(temp_dir)
     
-    # 1. Force the internal layer name to match the Title (Fixes index errors)
-    # 2. Use 'w' mode to overwrite if exists
     gpkg_name = f"{layer_title}.gpkg"
-    gdf.to_file(os.path.join(temp_dir, gpkg_name), layer=layer_title, driver="GPKG")
+    # Use 'w' to ensure fresh write
+    gdf.to_file(os.path.join(temp_dir, gpkg_name), layer=layer_title, driver="GPKG", mode="w")
     
     zip_path = f"/tmp/{layer_title}.zip"
     with ZipFile(zip_path, 'w') as zipf:
@@ -201,8 +201,7 @@ def prep_geopackage_zip(data_list, layer_title):
 
 def handle_arcgis_upload(gis, zip_path, layer_title, folder_name, item_props, overwrite_item_id=None):
     try:
-        # --- PUBLISH PARAMETERS (Fixes 'Job Failed') ---
-        # Explicitly telling AGOL the spatial reference and layer mapping prevents timeouts.
+        # Publish Parameters to prevent Job Failed error
         publish_parameters = {
             "name": layer_title,
             "targetSR": {"wkid": 4326},
@@ -212,6 +211,7 @@ def handle_arcgis_upload(gis, zip_path, layer_title, folder_name, item_props, ov
         }
 
         if overwrite_item_id:
+            # Overwrite Logic
             item = gis.content.get(overwrite_item_id)
             if not item: return "ERROR", "Target Item not found."
             
@@ -220,18 +220,30 @@ def handle_arcgis_upload(gis, zip_path, layer_title, folder_name, item_props, ov
             if item_props: item.update(item_properties=item_props)
             return "OVERWRITTEN", item.homepage
         else:
+            # New Upload Logic
+            # Check Folder logic: 'folder' arg in add() expects None for root, or string for folder
+            target_folder = folder_name if (folder_name and folder_name.strip() != "") else None
+
+            # Create folder if it doesn't exist? 
+            # gis.content.add() usually fails if folder name is passed but doesn't exist.
+            # We'll trust the dropdown logic, but if "Create New" was used, we must create it.
+            if target_folder:
+                folders = [f['title'] for f in gis.users.me.folders]
+                if target_folder not in folders:
+                    gis.content.create_folder(target_folder)
+
+            # Check for existing name collision
             query = f"title:\"{layer_title}\" AND owner:\"{gis.users.me.username}\" AND type:\"Feature Service\""
             search_res = gis.content.search(query=query, max_items=1)
-            
             if search_res: return "EXISTS", search_res[0].homepage
 
             final_props = {'type': 'GeoPackage', 'title': layer_title, 'tags': 'CDOT, LRS'}
             if item_props: final_props.update(item_props)
             
             # Add Item
-            shp_item = gis.content.add(final_props, data=zip_path, folder=folder_name)
+            shp_item = gis.content.add(final_props, data=zip_path, folder=target_folder)
             
-            # Publish with Parameters
+            # Publish
             feat_item = shp_item.publish(publish_parameters=publish_parameters)
             return "PUBLISHED", feat_item.homepage
     except Exception as e:
@@ -664,10 +676,20 @@ if st.session_state['processed']:
                             st.session_state['gis'] = gis
                             st.session_state['agol_creds'] = (p_url, p_user, p_pass)
                             
-                            with st.spinner("Fetching your content..."):
+                            with st.spinner("Fetching content & folders..."):
+                                # Fetch Content
                                 query = f"owner:{p_user} AND type:\"Feature Service\""
-                                user_content = gis.content.search(query=query, max_items=100)
-                                st.session_state['user_layers'] = {f"{item.title} ({item.id})": item.id for item in user_content}
+                                user_content = gis.content.search(query=query, max_items=200)
+                                # Store Sorted Tuple List (Title, ID) for cleaner dropdown
+                                content_list = [(item.title, item.id) for item in user_content]
+                                content_list.sort(key=lambda x: x[0])
+                                st.session_state['user_layers'] = content_list
+                                
+                                # Fetch Folders
+                                folder_list = [f['title'] for f in gis.users.me.folders]
+                                folder_list.sort()
+                                st.session_state['user_folders'] = folder_list
+
                             st.success(f"Connected as {gis.users.me.username}")
                             st.rerun()
                         except Exception as e:
@@ -689,12 +711,11 @@ if st.session_state['processed']:
                     up_name = ""
                     item_props = {}
                     ready_to_upload = False
+                    selected_folder_name = None
                     
                     if up_mode == "New Layer":
-                        # Logic to handle naming if both points and lines exist
-                        has_both = (n_pts > 0 and n_lns > 0)
-                        
-                        if has_both:
+                        # NAME & METADATA
+                        if (n_pts > 0 and n_lns > 0):
                             st.warning("⚠️ You are uploading both Points and Lines. You must provide unique names for each.")
                             up_name_pts = st.text_input("Layer Name for POINTS", f"{out_name}_Points")
                             up_name_lns = st.text_input("Layer Name for LINES", f"{out_name}_Lines")
@@ -703,12 +724,20 @@ if st.session_state['processed']:
                         
                         up_tags = st.text_input("Tags (comma separated)", "CDOT, LRS")
                         up_summary = st.text_area("Summary (Abstract)", "Generated by CDOT LRS Mapper")
-                        up_folder = st.text_input("Folder (Optional)")
                         
-                        item_props = {
-                            'tags': up_tags, 
-                            'snippet': up_summary
-                        }
+                        # FOLDER SELECTION
+                        f_options = ["[Root Folder]"] + st.session_state['user_folders'] + ["➕ Create New Folder"]
+                        folder_choice = st.selectbox("Destination Folder", f_options)
+                        
+                        if folder_choice == "➕ Create New Folder":
+                            new_f_name = st.text_input("Enter New Folder Name")
+                            if new_f_name: selected_folder_name = new_f_name
+                        elif folder_choice != "[Root Folder]":
+                            selected_folder_name = folder_choice
+                        else:
+                            selected_folder_name = None # Root
+                        
+                        item_props = {'tags': up_tags, 'snippet': up_summary}
                         ready_to_upload = True
                         
                     else:
@@ -716,10 +745,13 @@ if st.session_state['processed']:
                         st.markdown('<div class="warning-box">⚠️ <b>DANGER ZONE:</b> Overwriting replaces the entire dataset. This can break maps, dashboards, and apps that rely on specific field names or data.</div>', unsafe_allow_html=True)
                         
                         if st.session_state['user_layers']:
-                            selected_layer_key = st.selectbox("Select Layer to Overwrite", list(st.session_state['user_layers'].keys()))
-                            target_item_id = st.session_state['user_layers'][selected_layer_key]
-                            up_name = selected_layer_key.split(" (")[0]
-                            up_folder = None
+                            # CLEANER DROPDOWN: Shows "Title" only, maps back to ID
+                            layer_options = [x[0] for x in st.session_state['user_layers']]
+                            selected_title = st.selectbox("Select Layer to Overwrite", layer_options)
+                            
+                            # Find ID for selected title
+                            target_item_id = next((x[1] for x in st.session_state['user_layers'] if x[0] == selected_title), None)
+                            up_name = selected_title # Just for labelling
                             
                             # Pre-check schema
                             if n_lns > 0 or n_pts > 0:
@@ -736,36 +768,33 @@ if st.session_state['processed']:
                                     st.success("✅ New schema appears compatible (all existing fields present).")
                             
                             ack = st.checkbox("⚠️ I acknowledge that overwriting is permanent and may break dependent apps.")
-                            if ack:
-                                ready_to_upload = True
+                            if ack: ready_to_upload = True
                         else:
                             st.warning("No Feature Layers found in your content.")
 
                     if st.button("Upload & Publish", disabled=not ready_to_upload):
                         with st.spinner("Processing Upload..."):
                             
-                            # LOGIC FOR SINGLE vs SPLIT UPLOAD
                             if up_mode == "New Layer" and (n_pts > 0 and n_lns > 0):
                                 # Dual Upload
                                 zip_path, _ = prep_geopackage_zip(st.session_state['success_pts'], up_name_pts)
                                 if zip_path:
-                                    status, msg = handle_arcgis_upload(gis, zip_path, up_name_pts, up_folder, item_props, None)
+                                    status, msg = handle_arcgis_upload(gis, zip_path, up_name_pts, selected_folder_name, item_props, None)
                                     if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Points {status}: [View Item]({msg})")
                                     else: st.error(f"Points Error: {msg}")
                                     
                                 zip_path, _ = prep_geopackage_zip(st.session_state['success_lns'], up_name_lns)
                                 if zip_path:
-                                    status, msg = handle_arcgis_upload(gis, zip_path, up_name_lns, up_folder, item_props, None)
+                                    status, msg = handle_arcgis_upload(gis, zip_path, up_name_lns, selected_folder_name, item_props, None)
                                     if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Lines {status}: [View Item]({msg})")
                                     else: st.error(f"Lines Error: {msg}")
                             
                             else:
-                                # Standard Single Upload (Or Overwrite)
-                                # Pass the CLEAN name (no suffixes added by code)
+                                # Standard Single Upload
                                 if n_pts > 0:
                                     zip_path, _ = prep_geopackage_zip(st.session_state['success_pts'], up_name)
                                     if zip_path:
-                                        status, msg = handle_arcgis_upload(gis, zip_path, up_name, up_folder, item_props, target_item_id)
+                                        status, msg = handle_arcgis_upload(gis, zip_path, up_name, selected_folder_name, item_props, target_item_id)
                                         if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Points {status}: [View Item]({msg})")
                                         elif status == "EXISTS": st.warning(f"Layer '{up_name}' already exists.")
                                         else: st.error(f"Points Error: {msg}")
@@ -773,7 +802,7 @@ if st.session_state['processed']:
                                 if n_lns > 0:
                                     zip_path, _ = prep_geopackage_zip(st.session_state['success_lns'], up_name)
                                     if zip_path:
-                                        status, msg = handle_arcgis_upload(gis, zip_path, up_name, up_folder, item_props, target_item_id)
+                                        status, msg = handle_arcgis_upload(gis, zip_path, up_name, selected_folder_name, item_props, target_item_id)
                                         if status in ["PUBLISHED", "OVERWRITTEN"]: st.success(f"Lines {status}: [View Item]({msg})")
                                         elif status == "EXISTS": st.warning(f"Layer '{up_name}' already exists.")
                                         else: st.error(f"Lines Error: {msg}")
