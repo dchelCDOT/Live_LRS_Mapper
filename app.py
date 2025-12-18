@@ -13,13 +13,25 @@ import shutil
 import numpy as np 
 from zipfile import ZipFile
 
-# --- ARCGIS LIBRARY CHECK ---
+# --- ARCGIS LIBRARY CHECK & PATCH ---
 try:
     from arcgis.gis import GIS
     from arcgis.features import FeatureLayerCollection
+    import arcgis.features.geo
+    
+    # --- MONKEY PATCH FOR 'is_geoenabled' ERROR ---
+    # Fixes compatibility issues between arcgis and pandas versions
+    if not hasattr(arcgis.features.geo, '_is_geoenabled'):
+        def _is_geoenabled(df):
+            return hasattr(df, 'spatial')
+        arcgis.features.geo._is_geoenabled = _is_geoenabled
+        
     ARCGIS_AVAILABLE = True
 except ImportError:
     ARCGIS_AVAILABLE = False
+except Exception:
+    # Fallback if patching fails, but usually allows import to proceed
+    ARCGIS_AVAILABLE = True 
 
 # --- PAGE CONFIG ---
 st.set_page_config(
@@ -599,7 +611,7 @@ if st.session_state['processed']:
                             st.session_state['gis'] = gis
                             st.session_state['agol_creds'] = (p_url, p_user, p_pass)
                             
-                            # Fetch Content (Using Search instead of .items)
+                            # Fetch Content (Using SEARCH for robustness)
                             with st.spinner("Fetching your content..."):
                                 query = f"owner:{p_user} AND type:\"Feature Service\""
                                 user_content = gis.content.search(query=query, max_items=100)
