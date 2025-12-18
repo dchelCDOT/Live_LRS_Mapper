@@ -9,6 +9,7 @@ from streamlit_folium import st_folium
 import requests
 import io
 import os
+import numpy as np 
 from zipfile import ZipFile
 
 # --- PAGE CONFIG ---
@@ -23,7 +24,6 @@ st.set_page_config(
 CDOT_BLUE = "#004899"
 CDOT_GREEN = "#245436"
 CDOT_LOGO_URL = "https://www.codot.gov/assets/sitelogo.png"
-# Official CDOT Route Reference Table
 REF_SHEET_URL = "https://docs.google.com/spreadsheets/d/1XGOEZdtynaX3ox40GBD9SqhP1VlM69HSxIVsagxa3O8/export?format=csv"
 
 # --- CUSTOM CSS ---
@@ -68,9 +68,9 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         This tool maps tabular data (spreadsheets with Mileposts) onto the official CDOT Route Network.
         
         **Features:**
-        * **Multi-Segment Support:** Handles routes split into multiple GIS features.
         * **Smart Validation:** Checks MP limits against the official CDOT Reference table.
-        * **Robust Mapping:** Automatically handles complex geometries.
+        * **Resampling Engine:** Generates valid lines even on broken/complex GIS topology.
+        * **Topology Repair:** Merges disjoint line segments automatically.
         """)
     with col_how:
         st.subheader("How to use it")
@@ -122,7 +122,6 @@ def get_arcgis_features(service_url):
 
 @st.cache_data
 def get_reference_data(url):
-    """Loads Google Sheet for Route Validation."""
     try:
         df = pd.read_csv(url)
         df.columns = [c.strip().upper() for c in df.columns]
@@ -168,8 +167,11 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                 try: bm_val = float(row[bm_col])
                 except: raise ValueError(f"Invalid Begin Measure format: {row[bm_col]}")
                 
+                # Check Min
                 if bm_val < limits['min']:
                     raise ValueError(f"Begin MP ({bm_val}) is below Route {rid} Minimum ({limits['min']})")
+                
+                # Check Max 
                 if bm_val > limits['max']:
                     raise ValueError(f"Begin MP ({bm_val}) exceeds Route {rid} Maximum ({limits['max']})")
                 
@@ -178,21 +180,20 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                     except: raise ValueError(f"Invalid End Measure format: {row.get(em_col)}")
                     
                     if em_val > limits['max']:
-                        raise ValueError(f"End MP ({em_val}) exceeds Route {rid} Maximum ({limits['max']})")
-            
-            # --- 2. GIS PROCESSING (MULTI-SEGMENT SEARCH) ---
-            # Match ALL segments for this Route ID
+                         # Warn/Error if significantly over max
+                         if em_val > (limits['max'] + 0.1): 
+                             raise ValueError(f"End MP ({em_val}) exceeds Route {rid} Maximum ({limits['max']})")
+
+            # --- 2. GIS PROCESSING ---
             matches = routes[routes[gis_rid] == rid]
-            
             if matches.empty:
                 raise ValueError(f"Route ID '{rid}' Not Found in GIS Network")
             
-            # Parse User Inputs
+            # --- PARSE INPUTS ---
             try: bm_val = float(row[bm_col])
             except: raise ValueError(f"Invalid Begin Measure: {row[bm_col]}")
-            bm_meters = bm_val * unit_factor
             
-            # Determine Mode
+            # --- DETERMINE MODE ---
             is_point = False
             if mode == 'Point': is_point = True
             elif mode == 'Line': is_point = False
@@ -201,82 +202,86 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             
             final_geom = None
             
-            # --- ITERATE THROUGH ALL GIS SEGMENTS ---
-            # Many routes are split into multiple rows in the database.
-            # We check each one to see if it can produce valid geometry.
-            
-            if is_point:
-                # Point Mode: Find the segment containing the MP
-                for _, feat in matches.iterrows():
-                    geom = feat.geometry
-                    # Interpolate clamps points to the ends.
-                    # We check if the interpolated point is physically ON the line (not clamped distance)
-                    # But simpler approach: Use 'project' if available or just check valid range if LRS attributes exist.
-                    # Fallback: Just try interpolate.
-                    
-                    candidate_pt = geom.interpolate(bm_meters)
-                    
-                    # Check if "clamped" (i.e. if point is at exact start/end, checks if MP is within length)
-                    feat_len = geom.length
-                    # If bm_meters is > length, interpolate returns the end point.
-                    # This implies this wasn't the right segment (unless it's the very end).
-                    
-                    # Heuristic: We accept the first one that doesn't look purely clamped 
-                    # OR we just take the last one if all fail.
-                    # Better: If your GIS data has Min/Max measures, use them. 
-                    # Since we don't know the schema, we rely on geometry length.
-                    
-                    if bm_meters <= feat_len:
-                        final_geom = candidate_pt
-                        break # Found it!
+            # --- ITERATE SEGMENTS ---
+            # We iterate matches. If a robust geometry is found, we break.
+            for _, feat in matches.iterrows():
+                geom = feat.geometry
                 
-                if final_geom is None:
-                    # If we looped all and didn't find one where MP <= Length,
-                    # It likely means the MP is beyond the end of the entire route system.
-                    # We default to the LAST matched segment's end point (clamped).
-                    final_geom = matches.iloc[-1].geometry.interpolate(bm_meters)
+                # TOPOLOGY FIX: Merge MultiLineStrings
+                if geom.geom_type == 'MultiLineString':
+                    merged = linemerge(geom)
+                    if merged.geom_type in ['LineString', 'MultiLineString']:
+                        geom = merged
+                
+                bm_meters = bm_val * unit_factor
+                
+                if is_point:
+                    # Point Logic (Standard)
+                    if bm_meters <= geom.length:
+                        final_geom = geom.interpolate(bm_meters)
+                        break
+                else:
+                    # Line Logic
+                    try: em_val = float(row[em_col])
+                    except: raise ValueError(f"Invalid End Measure: {row.get(em_col)}")
+                    
+                    em_meters = em_val * unit_factor
+                    
+                    if bm_meters >= em_meters:
+                        if bm_meters == em_meters: raise ValueError("Begin MP == End MP (Use Point mode)")
+                        else: raise ValueError(f"End MP ({em_val}) < Begin MP ({bm_val})")
+                    
+                    # 1. Try Standard Substring First
+                    try:
+                        candidate_ln = substring(geom, bm_meters, em_meters)
+                        # Check if valid line
+                        if not candidate_ln.is_empty and candidate_ln.geom_type in ['LineString', 'MultiLineString'] and candidate_ln.length > 0.1:
+                            final_geom = candidate_ln
+                            break 
+                    except:
+                        pass # Substring failed, fall through to resampling
+                    
+                    # 2. RESAMPLING FALLBACK (The "Connect the Dots" Engine)
+                    # If substring failed or returned a point, we manually reconstruct the line.
+                    # This works even if the underlying topology is complex or "collapsed" in standard tools.
+                    
+                    # Only attempt if the measures are vaguely within this segment's range
+                    # (Allowing for some drift/clamping at the end)
+                    if bm_meters < (geom.length + 50): # Start is within range
+                         # Clamp End
+                         actual_end_m = min(em_meters, geom.length)
+                         actual_start_m = min(bm_meters, geom.length)
+                         
+                         if actual_end_m > actual_start_m:
+                             # Calculate number of points to sample (e.g., every 10 meters)
+                             # Minimum 2 points (start/end)
+                             segment_len = actual_end_m - actual_start_m
+                             num_points = max(2, int(segment_len / 10)) 
+                             
+                             # Generate distances
+                             distances = np.linspace(actual_start_m, actual_end_m, num=num_points)
+                             
+                             # Interpolate points along the curve
+                             points = [geom.interpolate(d) for d in distances]
+                             
+                             # Validate points are distinct (at least start and end)
+                             if points[0].distance(points[-1]) > 0.1:
+                                 final_geom = LineString(points)
+                                 break # Success with resampling!
 
-            else:
-                # Line Mode: Find segment containing the range
-                try: em_val = float(row[em_col])
-                except: raise ValueError(f"Invalid End Measure: {row.get(em_col)}")
-                em_meters = em_val * unit_factor
-                
-                if bm_meters >= em_meters:
-                     if bm_meters == em_meters: raise ValueError("Begin MP == End MP (Use Point mode)")
-                     else: raise ValueError(f"End MP ({em_val}) < Begin MP ({bm_val})")
+            # --- ERROR HANDLING ---
+            if final_geom is None:
+                 if is_point:
+                     # If point failed, try clamping to the very last segment's end
+                     # This handles cases where user is just slightly past the end of the route
+                     last_geom = matches.iloc[-1].geometry
+                     if bm_val * unit_factor > last_geom.length:
+                         final_geom = last_geom.interpolate(last_geom.length) # Clamp to end
+                     else:
+                         raise ValueError("Measure out of range of all found route segments.")
+                 else:
+                     raise ValueError("Could not generate geometry. Segment likely falls in a gap or outside GIS limits.")
 
-                # Loop through all segments to find one that creates a valid line
-                for _, feat in matches.iterrows():
-                    geom = feat.geometry
-                    
-                    # Attempt Substring
-                    # Note: substring works even if coords are clamped, we must check the result
-                    candidate_ln = substring(geom, bm_meters, em_meters)
-                    
-                    # Valid if it is a LineString and has length > 0 (tolerance 1m)
-                    if not candidate_ln.is_empty and candidate_ln.length > 1.0:
-                        final_geom = candidate_ln
-                        break # Found a valid segment!
-                
-                # If still no valid geometry, use "Aggressive Fallback" on the LONGEST matching segment
-                # (This assumes the user is right and the GIS is short/gapped)
-                if final_geom is None:
-                    # Pick the longest GIS segment to project onto
-                    longest_feat = matches.loc[matches.geometry.length.idxmax()]
-                    geom = longest_feat.geometry
-                    
-                    p_start = geom.interpolate(bm_meters)
-                    p_end = geom.interpolate(em_meters)
-                    
-                    dist = p_start.distance(p_end)
-                    if dist > 1.0:
-                        final_geom = LineString([p_start, p_end])
-                    else:
-                        # Total Failure
-                        raise ValueError(f"Geometry collapsed. Input range ({bm_val}-{em_val}) likely falls within a gap or outside all {len(matches)} known GIS segments.")
-            
-            # --- FINALIZE ---
             res = row.copy()
             res['geometry'] = final_geom
             if 'Error_Message' in res: del res['Error_Message']
