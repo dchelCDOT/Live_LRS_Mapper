@@ -69,8 +69,8 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         
         **Features:**
         * **Smart Validation:** Checks MP limits against the official CDOT Reference table.
+        * **Offset Correction:** Correctly handles routes that do not start at MP 0.
         * **Resampling Engine:** Generates valid lines even on broken/complex GIS topology.
-        * **Topology Repair:** Merges disjoint line segments automatically.
         """)
     with col_how:
         st.subheader("How to use it")
@@ -162,8 +162,12 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             rid = str(row[rid_col]).strip()
             
             # --- 1. REFERENCE VALIDATION ---
+            route_min_mp = 0.0 # Default if no ref found
+            
             if ref_lookup and rid in ref_lookup:
                 limits = ref_lookup[rid]
+                route_min_mp = limits['min'] # Capture the START MP
+                
                 try: bm_val = float(row[bm_col])
                 except: raise ValueError(f"Invalid Begin Measure format: {row[bm_col]}")
                 
@@ -180,7 +184,6 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                     except: raise ValueError(f"Invalid End Measure format: {row.get(em_col)}")
                     
                     if em_val > limits['max']:
-                         # Warn/Error if significantly over max
                          if em_val > (limits['max'] + 0.1): 
                              raise ValueError(f"End MP ({em_val}) exceeds Route {rid} Maximum ({limits['max']})")
 
@@ -203,7 +206,6 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
             final_geom = None
             
             # --- ITERATE SEGMENTS ---
-            # We iterate matches. If a robust geometry is found, we break.
             for _, feat in matches.iterrows():
                 geom = feat.geometry
                 
@@ -213,10 +215,16 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                     if merged.geom_type in ['LineString', 'MultiLineString']:
                         geom = merged
                 
-                bm_meters = bm_val * unit_factor
+                # --- OFFSET CORRECTION ---
+                # We subtract the Route Min MP from the input MP to get distance from start of line
+                # E.g. If route starts at MP 10, and we want MP 12 -> 12 - 10 = 2 miles in.
+                
+                # Safety: ensure we don't get negative distance
+                relative_bm = max(0.0, bm_val - route_min_mp)
+                bm_meters = relative_bm * unit_factor
                 
                 if is_point:
-                    # Point Logic (Standard)
+                    # Point Logic
                     if bm_meters <= geom.length:
                         final_geom = geom.interpolate(bm_meters)
                         break
@@ -225,58 +233,47 @@ def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
                     try: em_val = float(row[em_col])
                     except: raise ValueError(f"Invalid End Measure: {row.get(em_col)}")
                     
-                    em_meters = em_val * unit_factor
+                    # Offset End MP as well
+                    relative_em = max(0.0, em_val - route_min_mp)
+                    em_meters = relative_em * unit_factor
                     
                     if bm_meters >= em_meters:
                         if bm_meters == em_meters: raise ValueError("Begin MP == End MP (Use Point mode)")
                         else: raise ValueError(f"End MP ({em_val}) < Begin MP ({bm_val})")
                     
-                    # 1. Try Standard Substring First
+                    # 1. Try Standard Substring
                     try:
                         candidate_ln = substring(geom, bm_meters, em_meters)
-                        # Check if valid line
                         if not candidate_ln.is_empty and candidate_ln.geom_type in ['LineString', 'MultiLineString'] and candidate_ln.length > 0.1:
                             final_geom = candidate_ln
                             break 
                     except:
-                        pass # Substring failed, fall through to resampling
+                        pass
                     
-                    # 2. RESAMPLING FALLBACK (The "Connect the Dots" Engine)
-                    # If substring failed or returned a point, we manually reconstruct the line.
-                    # This works even if the underlying topology is complex or "collapsed" in standard tools.
-                    
-                    # Only attempt if the measures are vaguely within this segment's range
-                    # (Allowing for some drift/clamping at the end)
-                    if bm_meters < (geom.length + 50): # Start is within range
-                         # Clamp End
+                    # 2. RESAMPLING FALLBACK
+                    if bm_meters < (geom.length + 50): 
                          actual_end_m = min(em_meters, geom.length)
                          actual_start_m = min(bm_meters, geom.length)
                          
                          if actual_end_m > actual_start_m:
-                             # Calculate number of points to sample (e.g., every 10 meters)
-                             # Minimum 2 points (start/end)
+                             # 10m Resolution
                              segment_len = actual_end_m - actual_start_m
                              num_points = max(2, int(segment_len / 10)) 
                              
-                             # Generate distances
                              distances = np.linspace(actual_start_m, actual_end_m, num=num_points)
-                             
-                             # Interpolate points along the curve
                              points = [geom.interpolate(d) for d in distances]
                              
-                             # Validate points are distinct (at least start and end)
                              if points[0].distance(points[-1]) > 0.1:
                                  final_geom = LineString(points)
-                                 break # Success with resampling!
+                                 break 
 
             # --- ERROR HANDLING ---
             if final_geom is None:
                  if is_point:
-                     # If point failed, try clamping to the very last segment's end
-                     # This handles cases where user is just slightly past the end of the route
+                     # Fallback clamp to end of last segment
                      last_geom = matches.iloc[-1].geometry
-                     if bm_val * unit_factor > last_geom.length:
-                         final_geom = last_geom.interpolate(last_geom.length) # Clamp to end
+                     if (bm_val - route_min_mp) * unit_factor > last_geom.length:
+                         final_geom = last_geom.interpolate(last_geom.length)
                      else:
                          raise ValueError("Measure out of range of all found route segments.")
                  else:
