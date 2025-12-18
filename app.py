@@ -18,7 +18,7 @@ st.markdown("""
 **Instructions:**
 1. Upload your CSV spreadsheet.
 2. Map your columns.
-3. Click **Run Analysis** to see the map and download results.
+3. Click **Run Analysis**.
 """)
 
 # --- CONSTANTS ---
@@ -61,6 +61,10 @@ def get_arcgis_features(service_url):
     gdf.set_crs(MAP_CRS, inplace=True)
     return gdf
 
+# --- SESSION STATE SETUP ---
+if 'results' not in st.session_state:
+    st.session_state['results'] = None
+
 # --- APP LOGIC ---
 
 uploaded_file = st.file_uploader("Upload Spreadsheet (.csv)", type="csv")
@@ -86,6 +90,7 @@ if uploaded_file is not None:
         mode = st.radio("Feature Type", ["Point", "Line", "Both"], index=2)
         out_name = st.text_input("Output Filename", "LRS_Results")
     
+    # --- RUN BUTTON ---
     if st.button("🚀 Run Analysis", type="primary"):
         # 1. Load Routes
         raw_routes = get_arcgis_features(ROUTE_SERVICE_URL)
@@ -102,13 +107,11 @@ if uploaded_file is not None:
             if name in routes.columns:
                 gis_rid = name
                 break
-        
         if not gis_rid:
             for c in routes.columns:
                 if c.upper() == 'ROUTE':
                     gis_rid = c
-                    break
-                    
+                    break     
         if not gis_rid:
             gis_rid = routes.columns[0]
         
@@ -126,7 +129,6 @@ if uploaded_file is not None:
             if idx % max(1, int(total_rows/10)) == 0:
                 progress_bar.progress(idx / total_rows)
 
-            # --- SINGLE TRY BLOCK FOR STABILITY ---
             try:
                 rid = row[csv_rid]
                 match = routes[routes[gis_rid] == rid]
@@ -136,106 +138,105 @@ if uploaded_file is not None:
                     
                 geom_meters = match.iloc[0].geometry
                 
-                # Parse Begin Measure
-                try:
-                    bm_val = float(row[bm_col])
-                except:
-                    raise ValueError(f"Invalid Begin Measure: {row[bm_col]}")
+                try: bm_val = float(row[bm_col])
+                except: raise ValueError(f"Invalid Begin Measure: {row[bm_col]}")
                     
                 bm_meters = bm_val * unit_factor
                 
-                # Determine Feature Type
                 is_point = False
                 if mode.lower() == 'point': is_point = True
                 elif mode.lower() == 'line': is_point = False
-                else: # Both
+                else: 
                     if em_col == '(None)' or pd.isna(row.get(em_col)): is_point = True
                 
-                # --- GEOMETRY GENERATION ---
                 if is_point:
                     pt_geom = geom_meters.interpolate(bm_meters)
                     res = row.copy()
                     res['geometry'] = pt_geom
                     valid_pts.append(res)
                 else:
-                    # Line Logic
-                    try:
-                        em_val = float(row[em_col])
-                    except:
-                         raise ValueError(f"Invalid End Measure: {row.get(em_col)}")
+                    try: em_val = float(row[em_col])
+                    except: raise ValueError(f"Invalid End Measure: {row.get(em_col)}")
                          
                     em_meters = em_val * unit_factor
                     
                     if bm_meters >= em_meters:
-                        if bm_meters == em_meters: 
-                            raise ValueError("End == Begin (Use Point mode)")
-                        else:
-                            raise ValueError("End Milepost is less than Begin Milepost")
+                        if bm_meters == em_meters: raise ValueError("End == Begin (Use Point mode)")
+                        else: raise ValueError("End Milepost is less than Begin Milepost")
                     
                     ln_geom = substring(geom_meters, bm_meters, em_meters)
                     
-                    if ln_geom.is_empty:
-                        raise ValueError("Resulting geometry is empty")
-                    elif ln_geom.geom_type in ['Point', 'MultiPoint']:
-                        raise ValueError("Geometry collapsed to Point (length too short)")
+                    if ln_geom.is_empty: raise ValueError("Resulting geometry is empty")
+                    elif ln_geom.geom_type in ['Point', 'MultiPoint']: raise ValueError("Geometry collapsed to Point")
                     else:
                         res = row.copy()
                         res['geometry'] = ln_geom
                         valid_lns.append(res)
 
             except Exception as e:
-                # Catch ANY error from the block above
                 errors.append({**row, "Error": str(e)})
                     
         progress_bar.progress(100)
         
-        # 4. Results & Map
-        st.success(f"Processing Complete! Points: {len(valid_pts)} | Lines: {len(valid_lns)} | Errors: {len(errors)}")
+        # SAVE TO SESSION STATE
+        st.session_state['results'] = {
+            'pts': valid_pts,
+            'lns': valid_lns,
+            'errors': errors,
+            'out_name': out_name
+        }
+
+# --- RENDER RESULTS (Persistent) ---
+if st.session_state['results']:
+    res = st.session_state['results']
+    st.divider()
+    st.success(f"Processing Complete! Points: {len(res['pts'])} | Lines: {len(res['lns'])} | Errors: {len(res['errors'])}")
+    
+    # MAP
+    m = folium.Map(location=[39.0, -105.5], zoom_start=7)
+    
+    def add_layer(data, name, color):
+        if not data: return
+        gdf = gpd.GeoDataFrame(data, crs=CALC_CRS).to_crs(MAP_CRS)
+        cols = [c for c in gdf.columns if c != 'geometry']
+        folium.GeoJson(
+            gdf, name=name,
+            style_function=lambda x: {'color': color, 'weight': 5},
+            popup=folium.GeoJsonPopup(fields=cols)
+        ).add_to(m)
         
-        # Map Prep (Centered on Colorado)
-        m = folium.Map(location=[39.0, -105.5], zoom_start=7)
+    add_layer(res['lns'], "Mapped Lines", "blue")
+    add_layer(res['pts'], "Mapped Points", "red")
+    folium.LayerControl().add_to(m)
+    
+    st_folium(m, width=1000, height=600)
+    
+    # DOWNLOAD
+    zip_buffer = io.BytesIO()
+    with ZipFile(zip_buffer, 'w') as zipf:
+        if res['errors']:
+            err_csv = pd.DataFrame(res['errors']).to_csv(index=False)
+            zipf.writestr("Error_Report.csv", err_csv)
         
-        def add_layer(data, name, color):
+        def write_shp_to_zip(data, name):
             if not data: return
-            gdf = gpd.GeoDataFrame(data, crs=CALC_CRS).to_crs(MAP_CRS)
-            cols = [c for c in gdf.columns if c != 'geometry']
-            folium.GeoJson(
-                gdf, name=name,
-                style_function=lambda x: {'color': color, 'weight': 5},
-                popup=folium.GeoJsonPopup(fields=cols)
-            ).add_to(m)
+            tmp_gdf = gpd.GeoDataFrame(data, crs=CALC_CRS).to_crs(MAP_CRS)
+            tmp_path = f"/tmp/{name}.shp"
+            tmp_gdf.to_file(tmp_path)
             
-        add_layer(valid_lns, "Mapped Lines", "blue")
-        add_layer(valid_pts, "Mapped Points", "red")
-        folium.LayerControl().add_to(m)
+            base_dir = "/tmp"
+            for f in os.listdir(base_dir):
+                if f.startswith(name): 
+                    zipf.write(os.path.join(base_dir, f), f)
+                    try: os.remove(os.path.join(base_dir, f)) 
+                    except: pass
         
-        st_folium(m, width=1000, height=600)
+        write_shp_to_zip(res['lns'], f"{res['out_name']}_Lines")
+        write_shp_to_zip(res['pts'], f"{res['out_name']}_Points")
         
-        # 5. Zip Download
-        zip_buffer = io.BytesIO()
-        with ZipFile(zip_buffer, 'w') as zipf:
-            if errors:
-                err_csv = pd.DataFrame(errors).to_csv(index=False)
-                zipf.writestr("Error_Report.csv", err_csv)
-            
-            def write_shp_to_zip(data, name):
-                if not data: return
-                tmp_gdf = gpd.GeoDataFrame(data, crs=CALC_CRS).to_crs(MAP_CRS)
-                tmp_path = f"/tmp/{name}.shp"
-                tmp_gdf.to_file(tmp_path)
-                
-                base_dir = "/tmp"
-                for f in os.listdir(base_dir):
-                    if f.startswith(name): 
-                        zipf.write(os.path.join(base_dir, f), f)
-                        os.remove(os.path.join(base_dir, f)) 
-            
-            write_shp_to_zip(valid_lns, f"{out_name}_Lines")
-            write_shp_to_zip(valid_pts, f"{out_name}_Points")
-            
-        st.download_button(
-            label="📦 Download ZIP Result",
-            data=zip_buffer.getvalue(),
-            file_name=f"{out_name}.zip",
-            mime="application/zip"
-        )
+    st.download_button(
+        label="📦 Download ZIP Result",
+        data=zip_buffer.getvalue(),
+        file_name=f"{res['out_name']}.zip",
+        mime="application/zip"
+    )
