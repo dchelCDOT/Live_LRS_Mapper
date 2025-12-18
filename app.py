@@ -24,6 +24,8 @@ st.set_page_config(
 CDOT_BLUE = "#004899"
 CDOT_GREEN = "#245436"
 CDOT_LOGO_URL = "https://www.codot.gov/assets/sitelogo.png"
+# Google Sheet Export Link (CSV)
+REF_SHEET_URL = "https://docs.google.com/spreadsheets/d/1XGOEZdtynaX3ox40GBD9SqhP1VlM69HSxIVsagxa3O8/export?format=csv"
 
 # --- CUSTOM CSS ---
 st.markdown(f"""
@@ -78,7 +80,8 @@ with st.expander("ℹ️ About this Tool & How to Use (Click to Expand)", expand
         
         **Features:**
         * **Live Error Fixing:** Edit bad data directly in the app and re-map it.
-        * **High Performance:** optimized for speed.
+        * **Smart Validation:** Checks mileposts against official CDOT route limits.
+        * **High Performance:** Optimized for speed using HTML5 Canvas.
         * **Export:** Generates Shapefiles and Error Reports.
         """)
     with col_how:
@@ -103,8 +106,9 @@ if 'success_pts' not in st.session_state: st.session_state['success_pts'] = []
 if 'success_lns' not in st.session_state: st.session_state['success_lns'] = []
 if 'error_df' not in st.session_state: st.session_state['error_df'] = None
 if 'processed' not in st.session_state: st.session_state['processed'] = False
+if 'ref_data' not in st.session_state: st.session_state['ref_data'] = None
 
-# --- GIS UTILS ---
+# --- UTILS ---
 @st.cache_data
 def get_arcgis_features(service_url):
     all_features = []
@@ -129,7 +133,36 @@ def get_arcgis_features(service_url):
     gdf.set_crs(MAP_CRS, inplace=True)
     return gdf
 
-def process_batch(df_batch, routes, col_map, mode):
+@st.cache_data
+def get_reference_data(url):
+    """Loads the Google Sheet to validate MP limits."""
+    try:
+        df = pd.read_csv(url)
+        # Normalize columns to Upper Case for matching
+        df.columns = [c.strip().upper() for c in df.columns]
+        
+        # Identify key columns based on user instruction
+        # "ROUTE", "MINIMUM EXTENT", "MAXIMUM EXTENT"
+        rid_col = next((c for c in df.columns if 'ROUTE' in c), None)
+        min_col = next((c for c in df.columns if 'MINIMUM' in c and 'EXTENT' in c), None)
+        max_col = next((c for c in df.columns if 'MAXIMUM' in c and 'EXTENT' in c), None)
+        
+        if rid_col and min_col and max_col:
+            # Create a clean lookup dictionary: { 'ROUTEID': {'min': 0.0, 'max': 50.0} }
+            ref_dict = {}
+            for _, row in df.iterrows():
+                try:
+                    r_id = str(row[rid_col]).strip()
+                    r_min = float(row[min_col])
+                    r_max = float(row[max_col])
+                    ref_dict[r_id] = {'min': r_min, 'max': r_max}
+                except: continue
+            return ref_dict
+        return None
+    except Exception as e:
+        return None
+
+def process_batch(df_batch, routes, col_map, mode, ref_lookup=None):
     # Unpack columns
     rid_col = col_map['rid']
     bm_col = col_map['bm']
@@ -145,29 +178,51 @@ def process_batch(df_batch, routes, col_map, mode):
     
     for idx, row in df_batch.iterrows():
         try:
-            # 1. Match Route
-            rid = row[rid_col]
-            match = routes[routes[gis_rid] == rid]
+            rid = str(row[rid_col]).strip()
             
+            # --- 1. REFERENCE VALIDATION (The "Enhanced Error Message" Step) ---
+            if ref_lookup and rid in ref_lookup:
+                limits = ref_lookup[rid]
+                
+                # Check Begin MP
+                try: bm_val = float(row[bm_col])
+                except: raise ValueError(f"Invalid Begin Measure format: {row[bm_col]}")
+                
+                if bm_val < limits['min']:
+                    raise ValueError(f"Begin MP ({bm_val}) is below Route Minimum ({limits['min']})")
+                if bm_val > limits['max']:
+                    raise ValueError(f"Begin MP ({bm_val}) exceeds Route Maximum ({limits['max']})")
+                
+                # Check End MP (if line)
+                if mode != 'Point' and em_col != '(None)' and not pd.isna(row.get(em_col)):
+                    try: em_val = float(row[em_col])
+                    except: raise ValueError(f"Invalid End Measure format: {row.get(em_col)}")
+                    
+                    if em_val > limits['max']:
+                        raise ValueError(f"End MP ({em_val}) exceeds Route Maximum ({limits['max']})")
+            
+            # --- 2. GIS PROCESSING ---
+            # Match Route
+            match = routes[routes[gis_rid] == rid]
             if match.empty:
-                raise ValueError(f"Route ID '{rid}' Not Found")
+                # If we have ref data but GIS failed, it might mean the GIS layer is outdated 
+                # or the ID format is slightly different.
+                raise ValueError(f"Route ID '{rid}' Not Found in GIS Network")
             
             geom_meters = match.iloc[0].geometry
             
-            # 2. Parse Begin Measure
-            try: bm_val = float(row[bm_col])
-            except: raise ValueError(f"Invalid Begin Measure: {row[bm_col]}")
-            
+            # Parse Begin Measure
+            bm_val = float(row[bm_col])
             bm_meters = bm_val * unit_factor
             
-            # 3. Determine Geometry Type
+            # Determine Geometry Type
             is_point = False
             if mode == 'Point': is_point = True
             elif mode == 'Line': is_point = False
             else: # Both
                 if em_col == '(None)' or pd.isna(row.get(em_col)): is_point = True
             
-            # 4. Generate Geometry
+            # Generate Geometry
             if is_point:
                 pt_geom = geom_meters.interpolate(bm_meters)
                 res = row.copy()
@@ -184,15 +239,28 @@ def process_batch(df_batch, routes, col_map, mode):
                     if bm_meters == em_meters: raise ValueError("Begin MP == End MP (Use Point mode)")
                     else: raise ValueError(f"End MP ({em_val}) < Begin MP ({bm_val})")
                 
+                # --- ROBUST LINE GENERATION (from previous step) ---
                 ln_geom = substring(geom_meters, bm_meters, em_meters)
                 
-                if ln_geom.is_empty: raise ValueError("Result empty")
-                elif ln_geom.geom_type in ['Point', 'MultiPoint']: raise ValueError("Collapsed to Point")
-                else:
-                    res = row.copy()
-                    res['geometry'] = ln_geom
-                    if 'Error_Message' in res: del res['Error_Message']
-                    v_lns.append(res)
+                if ln_geom.geom_type in ['Point', 'MultiPoint']:
+                    # Fallback: Manual Interpolation for short/collapsed segments
+                    p_start = geom_meters.interpolate(bm_meters)
+                    p_end = geom_meters.interpolate(em_meters)
+                    dist = p_start.distance(p_end)
+                    
+                    if dist < 0.1: 
+                        route_len = geom_meters.length / unit_factor
+                        raise ValueError(f"Geometry collapsed (GIS Length: {route_len:.2f} mi). Verify MP range.")
+                    else:
+                        ln_geom = LineString([p_start, p_end])
+
+                if ln_geom.is_empty: 
+                    raise ValueError("Result empty (Measures likely outside GIS geometry)")
+                
+                res = row.copy()
+                res['geometry'] = ln_geom
+                if 'Error_Message' in res: del res['Error_Message']
+                v_lns.append(res)
 
         except Exception as e:
             row['Error_Message'] = str(e)
@@ -204,48 +272,49 @@ def process_batch(df_batch, routes, col_map, mode):
 st.subheader("1. Data Upload")
 st.info(f"**Need help formatting?** Use our [Highway Route & Reference Mapping Toolbox]({'https://script.google.com/a/macros/state.co.us/s/AKfycbxNe4UVfAAngo5W0M_fTrduePeip-yW4zbGRm6NIjNY-87rQy3D86jshHVBUXpPxb5p7A/exec'}).")
 
-uploaded_file = st.file_uploader("Upload .csv or .xlsx", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Upload Data (.csv or .xlsx)", type=["csv", "xlsx"])
 
+# --- LOAD DATA ---
+df_main = None
 if uploaded_file:
-    # Load Data
     try:
         if uploaded_file.name.endswith('.csv'):
             df_main = pd.read_csv(uploaded_file)
             default_out_name = os.path.splitext(uploaded_file.name)[0]
         else:
             xls = pd.ExcelFile(uploaded_file)
-            if len(xls.sheet_names) > 1:
-                sheet = st.selectbox("Select Sheet", xls.sheet_names)
-                df_main = pd.read_excel(uploaded_file, sheet_name=sheet)
-                default_out_name = sheet
-            else:
-                df_main = pd.read_excel(uploaded_file, sheet_name=xls.sheet_names[0])
-                default_out_name = os.path.splitext(uploaded_file.name)[0]
+            df_main = pd.read_excel(uploaded_file, sheet_name=0)
+            default_out_name = os.path.splitext(uploaded_file.name)[0]
     except Exception as e:
-        st.error(f"Error reading file: {e}")
+        st.error(f"Error reading input file: {e}")
         st.stop()
-        
+
+if df_main is not None:
     cols = list(df_main.columns)
     
     # --- UI SECTION 2: CONFIG ---
     st.divider()
     st.subheader("2. Configuration")
     
+    # Input Data Mapping
     c1, c2, c3 = st.columns(3)
     with c1:
         rid_col = st.selectbox("Route ID Column", cols, index=0)
+    with c2:
         bm_col = st.selectbox("Begin MP Column", cols, index=1 if len(cols)>1 else 0)
+    with c3:
         em_opts = ['(None)'] + cols
         em_col = st.selectbox("End MP Column (Optional)", em_opts, index=0)
-    with c2:
+
+    # Output Settings
+    st.write("")
+    cc1, cc2, cc3 = st.columns(3)
+    with cc1:
         mode = st.radio("Feature Type", ["Point", "Line", "Both"], index=2)
+    with cc2:
         out_name = st.text_input("Output Filename", default_out_name)
-    with c3:
-        st.write("<b>Map Visualization</b>", unsafe_allow_html=True)
-        # --- COLOR PICKER ---
+    with cc3:
         feature_color = st.color_picker("Feature Color", CDOT_GREEN)
-        
-        # --- IGNORE ERROR TOGGLE ---
         st.write("")
         ignore_errors = st.checkbox("Ignore rows with mapping errors to allow valid rows to map", value=True)
 
@@ -270,6 +339,10 @@ if uploaded_file:
         if raw_routes is None: st.stop()
         routes = raw_routes.to_crs(CALC_CRS)
         
+        # Load Reference Data
+        with st.spinner("Loading Route Limits Reference..."):
+            ref_lookup = get_reference_data(REF_SHEET_URL)
+        
         # Detect GIS Column
         gis_rid = None
         for c in routes.columns:
@@ -279,14 +352,19 @@ if uploaded_file:
         
         col_map = {'rid': rid_col, 'bm': bm_col, 'em': em_col, 'gis_rid': gis_rid}
         st.session_state['col_map'] = col_map
+        st.session_state['ref_lookup'] = ref_lookup # Save for re-run
         
         with st.spinner("Processing..."):
-            pts, lns, errs = process_batch(df_main, routes, col_map, mode)
+            pts, lns, errs = process_batch(
+                df_main, routes, col_map, mode, ref_lookup
+            )
             
             st.session_state['success_pts'] = pts
             st.session_state['success_lns'] = lns
             if errs:
                 err_df = pd.DataFrame(errs)
+                # Auto-sort errors
+                err_df = err_df.sort_values('Error_Message')
                 cols = list(err_df.columns)
                 cols.insert(0, cols.pop(cols.index('Error_Message')))
                 st.session_state['error_df'] = err_df[cols]
@@ -309,14 +387,18 @@ if st.session_state['processed']:
                 raw_routes = get_arcgis_features(ROUTE_SERVICE_URL)
                 routes = raw_routes.to_crs(CALC_CRS)
                 col_map = st.session_state['col_map']
+                ref_lookup = st.session_state.get('ref_lookup', None)
                 
                 with st.spinner("Re-processing fixes..."):
-                    new_pts, new_lns, new_errs = process_batch(edited_errors, routes, col_map, mode)
+                    new_pts, new_lns, new_errs = process_batch(
+                        edited_errors, routes, col_map, mode, ref_lookup
+                    )
                     st.session_state['success_pts'].extend(new_pts)
                     st.session_state['success_lns'].extend(new_lns)
                     
                     if new_errs:
                         err_df = pd.DataFrame(new_errs)
+                        err_df = err_df.sort_values('Error_Message')
                         cols = list(err_df.columns)
                         if 'Error_Message' in cols: cols.insert(0, cols.pop(cols.index('Error_Message')))
                         st.session_state['error_df'] = err_df[cols]
@@ -342,7 +424,7 @@ if st.session_state['processed']:
     # --- PERFORMANCE MAP ---
     m = folium.Map(location=[39.1, -105.5], zoom_start=7, prefer_canvas=True)
     
-    # Helper for Points (Optimized GeoJSON)
+    # Helper for Points
     if n_pts > 0:
         valid_pts = [p for p in st.session_state['success_pts'] if p['geometry'] is not None]
         
@@ -367,14 +449,13 @@ if st.session_state['processed']:
                         }});
                     }}
                 """),
-                # --- UPDATED: SCROLLABLE POPUP ---
                 popup=folium.GeoJsonPopup(
                     fields=[c for c in pts_gdf.columns if c != 'geometry'],
                     style="max-width: 400px; max-height: 300px; overflow-y: auto; display: block;"
                 )
             ).add_to(m)
 
-    # Helper for Lines (Standard)
+    # Helper for Lines
     if n_lns > 0:
         valid_lns = [l for l in st.session_state['success_lns'] if l['geometry'] is not None]
         
@@ -388,7 +469,6 @@ if st.session_state['processed']:
                 lns_gdf,
                 name="Mapped Lines",
                 style_function=lambda x: {'color': feature_color, 'weight': 3},
-                # --- UPDATED: SCROLLABLE POPUP ---
                 popup=folium.GeoJsonPopup(
                     fields=[c for c in lns_gdf.columns if c != 'geometry'],
                     style="max-width: 400px; max-height: 300px; overflow-y: auto; display: block;"
@@ -429,6 +509,3 @@ if st.session_state['processed']:
         mime="application/zip",
         type="primary"
     )
-
-
-
