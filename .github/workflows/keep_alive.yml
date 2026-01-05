@@ -1,0 +1,19 @@
+name: Keep Streamlit App Alive
+
+# Controls when the workflow will run
+on:
+  # Schedule runs at 8:00 AM UTC every day (roughly 1:00 AM - 2:00 AM Colorado time)
+  schedule:
+    - cron: "0 8 * * *"
+  
+  # Allows you to run this workflow manually from the Actions tab for testing
+  workflow_dispatch:
+
+jobs:
+  ping_app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up Streamlit App
+        run: |
+          # Replace the URL below with your specific Streamlit App URL
+          curl -I https://lrsmapper.streamlit.app/
