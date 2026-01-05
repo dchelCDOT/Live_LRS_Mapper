@@ -33,7 +33,7 @@ except Exception:
 
 # --- PAGE CONFIG ---
 st.set_page_config(
-    page_title="CDOT Route and Reference Mapper",
+    page_title="CDOT Route and Reference Mapper Developed with Gemini",
     page_icon="🛣️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -808,3 +808,4 @@ if st.session_state['processed']:
                                         else: st.error(f"Lines Error: {msg}")
         else:
             st.info("The 'arcgis' library is missing. Upload features are disabled.")
+
